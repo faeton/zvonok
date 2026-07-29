@@ -1,0 +1,12 @@
+# Pinned: this service can spend money, so a surprise minor release is not a
+# risk worth taking for the convenience of floating versions. Versions current
+# as of 2026-07-27.
+fastapi==0.140.7
+uvicorn[standard]==0.51.0
+pydantic==2.13.4
+asyncpg==0.31.0
+httpx==0.28.1
+jsonschema==4.26.0
+# Control-plane client only (dispatch, list_rooms, delete_room). Same version as
+# the agent image so the two agree about LiveKit's wire protocol.
+livekit-api==1.2.0

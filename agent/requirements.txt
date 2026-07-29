@@ -1,0 +1,9 @@
+# Pinned to the versions verified on 2026-07-27 (BRIEF §5.3).
+# livekit-agents[xai] pulls livekit-plugins-xai + the openai realtime base it extends.
+livekit-agents[xai]==1.6.7
+# Reporting call outcomes to call-api (phase 2). Explicit rather than relying on
+# whatever livekit-agents happens to pull in transitively.
+httpx==0.28.1
+# Output-gain DSP in agent.py. Already a livekit-agents dependency; explicit for
+# the same reason as httpx.
+numpy>=1.26,<3

@@ -1,0 +1,19 @@
+# Secrets never enter this repo (BRIEF §6, ACCOUNTS.md).
+.env
+*.env
+!deploy/.env.example
+deploy/livekit.rendered.yaml
+
+# Call data stays on de1.
+deploy/transcripts/
+*.wav
+
+__pycache__/
+*.pyc
+.venv/
+
+# Holds the mac-claude bearer token (BRIEF §6: secrets never enter this repo).
+.mcp.json
+
+# Private registration state (account numbers, DIDs, balances) — local only.
+ACCOUNTS.md

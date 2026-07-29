@@ -1,0 +1,197 @@
+# zvonok — realtime path (redis + livekit-server + livekit-sip + voice-agent)
+# plus the phase-2 product spine (postgres + call-api).
+#
+# Deployed on de1 only (BRIEF §3). Everything runs on HOST networking: livekit-sip
+# needs the 10000-20000/udp RTP range, which is unusable through docker port
+# mapping, and once one service is on the host network the others must be too in
+# order to reach it on loopback. The consequence is that each service is
+# responsible for binding narrowly itself — see the bind addresses below.
+#
+# Secrets come from .env (git-ignored, lives on de1 only). See .env.example.
+
+# Docker's default json-file driver has NO size limit. de1 is a shared host and
+# SIP logging is verbose (every INVITE, every retransmit from the carrier), so an
+# unbounded log is a slow disk-fill affecting every other service on the box.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: zvonok-redis
+    restart: unless-stopped
+    logging: *logging
+    # --bind 127.0.0.1 is load-bearing, not decoration: on host networking the
+    # image's default would listen on every interface, and the only thing
+    # standing between that and the internet would be the nftables drop policy.
+    # Every consumer (livekit-server, livekit-sip) is host-networked too, so
+    # loopback is all they need (BRIEF §5.2: Redis is never exposed).
+    command: ["redis-server", "--bind", "127.0.0.1", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis_data:/data
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  livekit:
+    # Pinned. `latest` on the media path means an upstream release can silently
+    # change SIP signalling, room lifecycle or codec behaviour on the next pull —
+    # on a service where behaviour changes cost money. These are the versions
+    # verified in BRIEF §9 phase 1.
+    image: livekit/livekit-server:v1.13.4
+    container_name: zvonok-livekit
+    restart: unless-stopped
+    logging: *logging
+    network_mode: host
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      # Rendered from livekit.yaml by deploy.sh with the real keys substituted —
+      # livekit.yaml itself stays placeholder-only so it is safe to commit.
+      - ./livekit.rendered.yaml:/etc/livekit.yaml:ro
+
+  sip:
+    # Pinned by digest: livekit/sip publishes no v1.8.0 tag, and this is the
+    # exact image that phase 1 was validated against.
+    image: livekit/sip@sha256:ad8dafcbde3327883d03c50684bb7004f626b3a2d055a2dfe18973dab91f9536
+    container_name: zvonok-sip
+    restart: unless-stopped
+    logging: *logging
+    network_mode: host
+    depends_on:
+      - livekit
+    environment:
+      # Full YAML inline — the documented way to configure this image.
+      SIP_CONFIG_BODY: |
+        api_key: '${LIVEKIT_API_KEY}'
+        api_secret: '${LIVEKIT_API_SECRET}'
+        ws_url: 'ws://127.0.0.1:7880'
+        redis:
+          address: '127.0.0.1:6379'
+        sip_port: 5060
+        rtp_port: 10000-20000
+        use_external_ip: true
+        logging:
+          # info, not debug: debug logs every RTP/ICE internal on a shared host.
+          # Raise to debug deliberately when diagnosing a SIP problem.
+          level: info
+
+  agent:
+    build:
+      context: ../agent
+    image: zvonok-agent:phase1
+    container_name: zvonok-agent
+    restart: unless-stopped
+    logging: *logging
+    network_mode: host
+    depends_on:
+      - livekit
+    environment:
+      LIVEKIT_URL: ws://127.0.0.1:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      XAI_API_KEY: ${XAI_API_KEY}
+      SIP_OUTBOUND_TRUNK_ID: ${SIP_OUTBOUND_TRUNK_ID}
+      # Identity spoken on the call. The _RU variants exist for pronunciation:
+      # the model reads Cyrillic correctly on a Russian call, Latin it does not.
+      ZVONOK_OWNER_NAME: ${ZVONOK_OWNER_NAME:-}
+      ZVONOK_OWNER_NAME_RU: ${ZVONOK_OWNER_NAME_RU:-}
+      ZVONOK_OWNER_NAME_RU_GEN: ${ZVONOK_OWNER_NAME_RU_GEN:-}
+      ZVONOK_OWNER_FULLNAME: ${ZVONOK_OWNER_FULLNAME:-}
+      ZVONOK_OWNER_FULLNAME_RU: ${ZVONOK_OWNER_FULLNAME_RU:-}
+      ZVONOK_ASSISTANT_NAME: ${ZVONOK_ASSISTANT_NAME}
+      ZVONOK_ASSISTANT_NAME_RU: ${ZVONOK_ASSISTANT_NAME_RU}
+      # Contact numbers the agent may hand out mid-call, and how loud it speaks.
+      ZVONOK_BOOKING_PHONE: ${ZVONOK_BOOKING_PHONE:-}
+      ZVONOK_MESSENGER_PHONE: ${ZVONOK_MESSENGER_PHONE:-}
+      ZVONOK_MESSENGER_PHONE_NOTE: ${ZVONOK_MESSENGER_PHONE_NOTE:-}
+      ZVONOK_OUTPUT_GAIN: ${ZVONOK_OUTPUT_GAIN:-1.4}
+      ZVONOK_TRANSCRIPT_DIR: /data/transcripts
+      # Phase 2: report call outcomes to call-api. Unset these and the agent
+      # behaves exactly as it did in phase 1 (dispatch by hand, transcript to a
+      # file), which keeps the manual debugging path usable.
+      ZVONOK_API_URL: http://${ZVONOK_BIND_HOST}:${ZVONOK_API_PORT}
+      ZVONOK_INTERNAL_TOKEN: ${ZVONOK_INTERNAL_TOKEN}
+    volumes:
+      - ./transcripts:/data/transcripts
+    command: ["python", "-u", "agent.py", "start"]
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: zvonok-postgres
+    restart: unless-stopped
+    logging: *logging
+    network_mode: host
+    environment:
+      POSTGRES_USER: zvonok
+      POSTGRES_DB: zvonok
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    # Loopback only, for the same reason as redis: on host networking there is
+    # no docker-proxy and no published-port scoping to hide behind, and the job
+    # table is the audit record for a spend-capable actuator (BRIEF §5.2).
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U zvonok"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  call-api:
+    build:
+      context: ../api
+    image: zvonok-api:phase2
+    container_name: zvonok-call-api
+    restart: unless-stopped
+    logging: *logging
+    network_mode: host
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ZVONOK_DATABASE_URL: postgresql://zvonok:${POSTGRES_PASSWORD}@127.0.0.1:5432/zvonok
+      ZVONOK_API_TOKENS: ${ZVONOK_API_TOKENS}
+      ZVONOK_INTERNAL_TOKEN: ${ZVONOK_INTERNAL_TOKEN}
+      ZVONOK_WEBHOOK_SECRET: ${ZVONOK_WEBHOOK_SECRET}
+      LIVEKIT_HTTP_URL: http://127.0.0.1:7880
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      XAI_API_KEY: ${XAI_API_KEY}
+      ZVONOK_EXTRACTOR_MODEL: ${ZVONOK_EXTRACTOR_MODEL:-grok-latest}
+      # Caller-ID policy (deployment data, never hard-coded — see .env.example).
+      ZVONOK_OWNED_CALLER_IDS: ${ZVONOK_OWNED_CALLER_IDS:-}
+      ZVONOK_DEFAULT_CALLER_ID: ${ZVONOK_DEFAULT_CALLER_ID:-}
+      ZVONOK_CALLER_ID_BY_COUNTRY: ${ZVONOK_CALLER_ID_BY_COUNTRY:-}
+      ZVONOK_TRANSCRIPT_DIR: /data/transcripts
+      ZVONOK_MAX_CONCURRENT_CALLS: ${ZVONOK_MAX_CONCURRENT_CALLS:-2}
+      ZVONOK_DAILY_CALLS: ${ZVONOK_DAILY_CALLS:-40}
+      ZVONOK_DAILY_MINUTES: ${ZVONOK_DAILY_MINUTES:-60}
+      ZVONOK_DAILY_USD: ${ZVONOK_DAILY_USD:-10}
+    volumes:
+      # Read-only. This is the fallback half of at-least-once transcript
+      # delivery: an agent whose HTTP callback never lands still leaves a file
+      # here, and the janitor reconciles from it (BRIEF §9 phase-2 trap 4).
+      - ./transcripts:/data/transcripts:ro
+    # Bound to the TAILNET address, not 0.0.0.0. This API places calls that cost
+    # money; it has no public surface at all, and does not depend on the
+    # firewall staying correct to keep it that way (decided 2026-07-27).
+    command:
+      - uvicorn
+      - zvonok_api.main:app
+      - --host
+      - ${ZVONOK_BIND_HOST}
+      - --port
+      - ${ZVONOK_API_PORT}
+
+volumes:
+  redis_data:
+  pg_data:

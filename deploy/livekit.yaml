@@ -1,0 +1,29 @@
+# livekit-server config — phase 1, de1.
+#
+# Agents and livekit-sip all run locally on this host, so no WebRTC participant
+# ever arrives from the internet. ICE ports (7881/tcp, 7882/udp) therefore stay
+# CLOSED at the firewall for now (BRIEF §5.2) — open them only if a remote
+# browser/mobile participant is ever added.
+#
+# API key/secret are injected at deploy time from .env (see deploy.sh).
+
+port: 7880
+bind_addresses:
+  - 127.0.0.1
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 7882
+  port_range_end: 7892
+  use_external_ip: false
+
+redis:
+  address: 127.0.0.1:6379
+
+keys:
+  # populated by deploy.sh from LIVEKIT_API_KEY / LIVEKIT_API_SECRET
+  PLACEHOLDER_KEY: PLACEHOLDER_SECRET
+
+logging:
+  level: info
+  json: false
