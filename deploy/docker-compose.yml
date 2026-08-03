@@ -31,10 +31,13 @@ x-agent: &agent
   network_mode: host
   depends_on:
     - livekit
-  # Shared deliberately: files are named by job id, and the janitor needs one
-  # place to look when an agent's HTTP callback never lands (BRIEF §9 trap 4).
-  volumes:
-    - ./transcripts:/data/transcripts
+  # NO volumes here on purpose — each worker mounts only its OWN tenant's
+  # transcript directory, below. The janitor recovers a lost callback by reading
+  # the file the agent wrote (BRIEF §9 trap 4), and that path settles a call and
+  # bills extraction WITHOUT any token being presented. While every worker wrote
+  # into one shared directory, any of them could drop a file named for another
+  # tenant's job id and have it adopted as that call's outcome. Job ids are not
+  # secret; room names embed them. The bind mount is the enforcement.
   command: ["python", "-u", "agent.py", "start"]
 
 x-agent-env: &agent-env
@@ -122,8 +125,15 @@ services:
   agent:
     <<: *agent
     container_name: zvonok-agent
+    volumes:
+      - ./transcripts/default:/data/transcripts
     environment:
       <<: *agent-env
+      # Must match the tenant name this worker's calls are admitted under. The
+      # worker refuses a dispatch whose tenant is not this, BEFORE dialling —
+      # otherwise a duplicate or drifted agent_name puts the call on the wrong
+      # account's trunk and it sounds entirely normal.
+      ZVONOK_TENANT: default
       # The tenant routing key. call-api dispatches to a NAME, and that name
       # decides whose trunk and whose voice-brain key place the call.
       ZVONOK_AGENT_NAME: ${ZVONOK_AGENT_NAME:-zvonok-caller}
@@ -165,8 +175,12 @@ services:
     <<: *agent
     container_name: zvonok-agent-tenant2
     profiles: ["tenant2"]
+    volumes:
+      - ./transcripts/tenant2:/data/transcripts
     environment:
       <<: *agent-env
+      # Must equal the value ZVONOK_TENANT_<IDENTITY> maps their identity to.
+      ZVONOK_TENANT: tenant2
       ZVONOK_AGENT_NAME: ${ZVONOK_AGENT_NAME_TENANT2:-}
       ZVONOK_AGENT_PORT: ${ZVONOK_AGENT_PORT_TENANT2:-18132}
       # Overrides the anchor's shared token. Without this line the worker

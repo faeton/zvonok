@@ -373,6 +373,12 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
 
     metadata = {
         "job_id": job_id,
+        # So the worker can refuse a job that is not its account's. `agent_name`
+        # routes, but nothing verified that routing landed where it was aimed —
+        # a duplicate or drifted name silently dials on the wrong tenant's trunk
+        # and bills the wrong balance. The NAME is safe here; the trunk id and
+        # the keys are not, and still travel only in the worker's own env.
+        "tenant": tenant.name,
         "number": destination.number,
         "goal": req.goal,
         "language": req.language,

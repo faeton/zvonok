@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import db, dispatch, pipeline, states, webhooks
+from . import config as _config_mod
 from .config import settings
 
 logger = logging.getLogger("zvonok.janitor")
@@ -138,11 +139,33 @@ async def _recover_from_disk(job) -> bool:
     recoverable from the file the agent wrote before (and independently of)
     posting it.
     """
-    directory = Path(settings.transcript_dir)
-    if not directory.is_dir():
+    root = Path(settings.transcript_dir)
+    if not root.is_dir():
         return False
 
-    matches = sorted(directory.glob(f"*-{job['id']}.json"))
+    # Look in the job's OWN tenant's directory, not the shared root.
+    #
+    # This path finalises a call and triggers extraction without any token being
+    # presented — it is the one remaining way to settle a job without
+    # authenticating as its tenant. Globbing the shared root meant any worker
+    # that could write a file named `<anything>-<victim job id>.json` could have
+    # us adopt it as that call's outcome: replacing the transcript, settling the
+    # disposition, and billing extraction to the victim's xAI key. Job ids are
+    # not secret — room names embed them.
+    #
+    # Each worker mounts only its own tenant's directory, so the isolation is
+    # enforced by the bind mount rather than by anyone remembering a convention.
+    tenant = settings.tenant_of(job).name
+    directory = root / tenant
+    matches = sorted(directory.glob(f"*-{job['id']}.json")) if directory.is_dir() else []
+
+    if not matches and tenant == _config_mod.DEFAULT_TENANT:
+        # Files written before per-tenant directories existed sit in the root.
+        # Only the default tenant may claim them: on a single-tenant deployment
+        # there is no one to impersonate, and on a multi-tenant one an added
+        # tenant's worker cannot write to the root at all.
+        matches = sorted(root.glob(f"*-{job['id']}.json"))
+
     if not matches:
         return False
 

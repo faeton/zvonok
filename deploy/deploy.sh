@@ -59,11 +59,17 @@ chmod 600 livekit.rendered.yaml
 # The agent container runs as uid 10001 (non-root); the bind-mounted transcript
 # dir is created by the host user, so it must be chowned or writes fail with
 # EPERM after the call has already happened — the worst time to find out.
+# Per tenant, because each worker mounts only its own: the janitor's disk
+# recovery settles a call and bills extraction without any token, so a shared
+# directory let any worker drop a file named for another tenant's job id.
 mkdir -p transcripts
-if [[ "$(stat -c %u transcripts)" != "10001" ]]; then
-  sudo chown 10001:10001 transcripts
-  echo "==> chowned transcripts/ to uid 10001 (agent container user)"
-fi
+for tenant_dir in transcripts transcripts/default ${ZVONOK_TRANSCRIPT_TENANTS:-}; do
+  mkdir -p "$tenant_dir"
+  if [[ "$(stat -c %u "$tenant_dir")" != "10001" ]]; then
+    sudo chown 10001:10001 "$tenant_dir"
+    echo "==> chowned $tenant_dir/ to uid 10001 (agent container user)"
+  fi
+done
 
 docker compose up -d --build
 

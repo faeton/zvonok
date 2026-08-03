@@ -703,6 +703,27 @@ worker callbacks — `ZVONOK_INTERNAL_TOKEN` is **per tenant** and does not
 inherit, so the internal endpoints know not merely that *a* worker is reporting
 but *whose*.
 
+**Placement is verified, not merely routed.** `agent_name` decides which worker
+gets a dispatch; nothing used to check that it landed where it was aimed. The
+dispatch metadata now carries the tenant NAME, and a worker refuses a job that
+is not its own **before dialling** — so a duplicate or drifted `agent_name`,
+or an identity whose `ZVONOK_TENANT_<IDENTITY>` was never set (it silently
+becomes the default tenant, leaving every `_FRIEND` variable unused), fails
+loudly and for free instead of placing a normal-sounding call on the wrong
+account's trunk. The name is safe to send; the trunk id and the keys still
+travel only in the worker's own env, because dispatch metadata is persisted in
+Redis and logged.
+
+**Transcript directories are per tenant.** The janitor's disk recovery is the
+one path that settles a call and bills extraction with **no token presented at
+all** — it reads the file the agent wrote and adopts it as the outcome. While
+every worker wrote into one shared directory, any of them could drop a file
+named `<anything>-<victim job id>.json` and have it accepted; job ids are not
+secret, since room names embed them. Each worker now mounts only
+`transcripts/<tenant>`, so the isolation is a bind mount rather than a
+convention, and the janitor looks only in the job's own tenant's directory.
+Files predating this sit in the root and only the default tenant may claim them.
+
 **A job's tenant is stored, not re-derived.** `jobs.tenant` is written at
 admission and read by everything downstream (`Settings.tenant_of`). Dispatch
 already fixes the trunk and the caller ID when the call is placed; this makes
@@ -1274,27 +1295,6 @@ the class is worth listing rather than trusting:
     same thing unprompted. Options: a tenants file with env for secrets only, or
     generate the per-tenant compose service. Not urgent at two tenants; it is the
     thing that will bite at three.
-
-11. **Nothing binds a job's tenant to the trunk that actually dials it.** Named
-    by Grok as the next *working call, wrong bill*, and it is the honest limit of
-    what §5.7 currently guarantees. Placement isolation is still only
-    `agent_name` → whichever process registered that name → that process's
-    `SIP_OUTBOUND_TRUNK_ID`. The API never records the trunk on the job, and
-    nothing at dial time asserts that the worker's trunk matches `jobs.tenant`.
-    Three ways to reach it, all silent: worker env drift, a name registered at
-    LiveKit that differs from the configured one (`require()` checks *config*,
-    not who actually registered), and an identity whose `ZVONOK_TENANT_<IDENTITY>`
-    is simply unset — it becomes the default tenant, so every carefully set
-    `_FRIEND` variable sits unused while their calls leave on our trunk. Fix:
-    record the trunk id on the job at dispatch and have the worker refuse a job
-    whose trunk is not its own.
-
-12. **The janitor's disk recovery bypasses the internal token entirely.** It
-    reads the shared transcript directory and finalises by job id, so it is the
-    one remaining path that can settle a call and trigger extraction without
-    presenting a tenant's token at all. Lower priority than 11 because it
-    misattributes rather than dials, but it is the surviving hole in the fix
-    above and should not be rediscovered later as a surprise.
 
 ## 11. In-house prior art (found 2026-07-27)
 

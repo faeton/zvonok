@@ -119,6 +119,25 @@ OWNED_CALLER_IDS = frozenset(
     x.strip() for x in os.getenv("ZVONOK_OWNED_CALLER_IDS", "").split(",") if x.strip()
 )
 
+# Which billing account this worker dials for. Checked against the tenant in the
+# dispatch metadata before anything is dialled.
+#
+# Until this existed, placement isolation was ENTIRELY `agent_name`: call-api
+# dispatches to a name, LiveKit hands the job to whichever process registered
+# that name, and that process dials on whatever SIP_OUTBOUND_TRUNK_ID its own env
+# happens to hold. Nothing ever asserted the two agreed. Three ways to break it,
+# all silent and all ending in a normal-sounding call billed to the wrong
+# Zadarma account: worker env drift; a name registered at LiveKit that differs
+# from the one config checked (require() validates configuration, not who
+# actually registered); and an identity whose ZVONOK_TENANT_<IDENTITY> is simply
+# unset, which resolves to the default tenant while every carefully set _FRIEND
+# variable sits unused.
+#
+# The tenant NAME is safe to put in metadata — it is not a credential, and
+# agent_name already effectively discloses it. The trunk id deliberately still
+# does not travel that way (dispatch metadata is persisted in Redis and logged).
+TENANT = os.getenv("ZVONOK_TENANT", "default").strip() or "default"
+
 DEFAULT_GOAL = "Confirm you have reached the right person, ask how their day is going, and thank them."
 
 # Hard cap on simultaneous paid calls (BRIEF §6). Enforced at worker admission;
@@ -464,6 +483,27 @@ async def entrypoint(ctx: JobContext) -> None:
     number = meta.get("number")
     if not number:
         raise ValueError("dispatch metadata must include 'number'")
+
+    # Refuse before dialling, not after. A job that reached the wrong worker is
+    # about to leave on the wrong account's trunk, presenting the wrong account's
+    # caller ID, billed to the wrong balance — and it will sound completely
+    # normal to everyone involved, which is why nothing downstream would ever
+    # catch it. Loud and free is the only acceptable outcome here: nothing has
+    # been dialled, so nothing has been spent.
+    #
+    # Absent means an older call-api that does not send it; trust it, exactly as
+    # an unset OWNED_CALLER_IDS means "trust the API".
+    job_tenant = (meta.get("tenant") or "").strip()
+    if job_tenant and job_tenant != TENANT:
+        logger.error(
+            "job %s is tenant %r but this worker dials for %r — refusing. "
+            "Check ZVONOK_AGENT_NAME/ZVONOK_TENANT wiring: a duplicate or "
+            "drifted agent_name sends calls to the wrong account's trunk.",
+            meta.get("job_id") or ctx.job.id, job_tenant, TENANT,
+        )
+        raise ValueError(
+            f"job belongs to tenant {job_tenant!r}, this worker is {TENANT!r}"
+        )
 
     goal = meta.get("goal") or DEFAULT_GOAL
     language = meta.get("language", "en")
