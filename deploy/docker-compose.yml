@@ -18,6 +18,41 @@ x-logging: &logging
     max-size: "10m"
     max-file: "5"
 
+# One voice worker per TENANT (billing account). Everything account-specific —
+# SIP trunk, xAI key, caller identity — is in the worker's own env and never
+# travels through dispatch metadata, which is persisted in Redis and logged.
+# What follows is only the part every worker shares.
+x-agent: &agent
+  build:
+    context: ../agent
+  image: zvonok-agent:phase1
+  restart: unless-stopped
+  logging: *logging
+  network_mode: host
+  depends_on:
+    - livekit
+  # Shared deliberately: files are named by job id, and the janitor needs one
+  # place to look when an agent's HTTP callback never lands (BRIEF §9 trap 4).
+  volumes:
+    - ./transcripts:/data/transcripts
+  command: ["python", "-u", "agent.py", "start"]
+
+x-agent-env: &agent-env
+  LIVEKIT_URL: ws://127.0.0.1:7880
+  # Shared by every tenant's worker, because there is one LiveKit. This is a
+  # room-admin credential, so a tenant's worker could in principle join another
+  # tenant's room — the trust boundary that per-tenant DIDs and keys do not
+  # close. Acceptable between people who know each other; not between strangers.
+  LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+  LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+  ZVONOK_TRANSCRIPT_DIR: /data/transcripts
+  ZVONOK_OUTPUT_GAIN: ${ZVONOK_OUTPUT_GAIN:-1.4}
+  # Phase 2: report call outcomes to call-api. Unset these and the agent behaves
+  # exactly as it did in phase 1 (dispatch by hand, transcript to a file), which
+  # keeps the manual debugging path usable.
+  ZVONOK_API_URL: http://${ZVONOK_BIND_HOST}:${ZVONOK_API_PORT}
+  ZVONOK_INTERNAL_TOKEN: ${ZVONOK_INTERNAL_TOKEN}
+
 services:
   redis:
     image: redis:7-alpine
@@ -85,21 +120,18 @@ services:
           level: info
 
   agent:
-    build:
-      context: ../agent
-    image: zvonok-agent:phase1
+    <<: *agent
     container_name: zvonok-agent
-    restart: unless-stopped
-    logging: *logging
-    network_mode: host
-    depends_on:
-      - livekit
     environment:
-      LIVEKIT_URL: ws://127.0.0.1:7880
-      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+      <<: *agent-env
+      # The tenant routing key. call-api dispatches to a NAME, and that name
+      # decides whose trunk and whose voice-brain key place the call.
+      ZVONOK_AGENT_NAME: ${ZVONOK_AGENT_NAME:-zvonok-caller}
+      ZVONOK_AGENT_PORT: ${ZVONOK_AGENT_PORT:-18130}
       XAI_API_KEY: ${XAI_API_KEY}
       SIP_OUTBOUND_TRUNK_ID: ${SIP_OUTBOUND_TRUNK_ID}
+      # The worker re-checks any caller ID the API hands it against this list.
+      ZVONOK_OWNED_CALLER_IDS: ${ZVONOK_OWNED_CALLER_IDS:-}
       # Identity spoken on the call. The _RU variants exist for pronunciation:
       # the model reads Cyrillic correctly on a Russian call, Latin it does not.
       ZVONOK_OWNER_NAME: ${ZVONOK_OWNER_NAME:-}
@@ -109,20 +141,54 @@ services:
       ZVONOK_OWNER_FULLNAME_RU: ${ZVONOK_OWNER_FULLNAME_RU:-}
       ZVONOK_ASSISTANT_NAME: ${ZVONOK_ASSISTANT_NAME}
       ZVONOK_ASSISTANT_NAME_RU: ${ZVONOK_ASSISTANT_NAME_RU}
-      # Contact numbers the agent may hand out mid-call, and how loud it speaks.
+      ZVONOK_ASSISTANT_NAME_PL: ${ZVONOK_ASSISTANT_NAME_PL:-}
+      # Contact numbers the agent may hand out mid-call.
       ZVONOK_BOOKING_PHONE: ${ZVONOK_BOOKING_PHONE:-}
       ZVONOK_MESSENGER_PHONE: ${ZVONOK_MESSENGER_PHONE:-}
       ZVONOK_MESSENGER_PHONE_NOTE: ${ZVONOK_MESSENGER_PHONE_NOTE:-}
-      ZVONOK_OUTPUT_GAIN: ${ZVONOK_OUTPUT_GAIN:-1.4}
-      ZVONOK_TRANSCRIPT_DIR: /data/transcripts
-      # Phase 2: report call outcomes to call-api. Unset these and the agent
-      # behaves exactly as it did in phase 1 (dispatch by hand, transcript to a
-      # file), which keeps the manual debugging path usable.
-      ZVONOK_API_URL: http://${ZVONOK_BIND_HOST}:${ZVONOK_API_PORT}
-      ZVONOK_INTERNAL_TOKEN: ${ZVONOK_INTERNAL_TOKEN}
-    volumes:
-      - ./transcripts:/data/transcripts
-    command: ["python", "-u", "agent.py", "start"]
+
+  # A second billing account on the same box: their Zadarma trunk, their xAI
+  # key, their DIDs, their spoken identity. Nothing of theirs is in the service
+  # above, and nothing of ours is here — the two share LiveKit, Postgres and the
+  # host, and that is the whole of the overlap.
+  #
+  # Off by default. Enable with COMPOSE_PROFILES="tenant2" in .env (deploy.sh
+  # runs a plain `docker compose up`, and compose reads that variable from .env),
+  # and set ZVONOK_TENANT_<IDENTITY>="tenant2" so call-api routes to it.
+  #
+  # ⚠ Two things here MUST differ from the service above or calls land on the
+  # wrong account: ZVONOK_AGENT_NAME (the dispatch key) and ZVONOK_AGENT_PORT
+  # (host networking means the worker's debug server binds the real host port —
+  # a collision is fatal at startup, which is the good outcome; the bad one is
+  # a duplicated agent name, which fails silently by succeeding).
+  agent-tenant2:
+    <<: *agent
+    container_name: zvonok-agent-tenant2
+    profiles: ["tenant2"]
+    environment:
+      <<: *agent-env
+      ZVONOK_AGENT_NAME: ${ZVONOK_AGENT_NAME_TENANT2:-}
+      ZVONOK_AGENT_PORT: ${ZVONOK_AGENT_PORT_TENANT2:-18132}
+      # Overrides the anchor's shared token. Without this line the worker
+      # authenticates as the DEFAULT tenant at the internal endpoints, so its
+      # calls would settle against the wrong account and its transcripts would
+      # be extracted with the wrong xAI key — and call-api would have no way to
+      # tell, because the token is the only thing it has to go on.
+      ZVONOK_INTERNAL_TOKEN: ${ZVONOK_INTERNAL_TOKEN_TENANT2:-}
+      XAI_API_KEY: ${XAI_API_KEY_TENANT2:-}
+      SIP_OUTBOUND_TRUNK_ID: ${SIP_OUTBOUND_TRUNK_ID_TENANT2:-}
+      ZVONOK_OWNED_CALLER_IDS: ${ZVONOK_OWNED_CALLER_IDS_TENANT2:-}
+      ZVONOK_OWNER_NAME: ${ZVONOK_OWNER_NAME_TENANT2:-}
+      ZVONOK_OWNER_NAME_RU: ${ZVONOK_OWNER_NAME_RU_TENANT2:-}
+      ZVONOK_OWNER_NAME_RU_GEN: ${ZVONOK_OWNER_NAME_RU_GEN_TENANT2:-}
+      ZVONOK_OWNER_FULLNAME: ${ZVONOK_OWNER_FULLNAME_TENANT2:-}
+      ZVONOK_OWNER_FULLNAME_RU: ${ZVONOK_OWNER_FULLNAME_RU_TENANT2:-}
+      ZVONOK_ASSISTANT_NAME: ${ZVONOK_ASSISTANT_NAME_TENANT2:-Klava}
+      ZVONOK_ASSISTANT_NAME_RU: ${ZVONOK_ASSISTANT_NAME_RU_TENANT2:-Клава}
+      ZVONOK_ASSISTANT_NAME_PL: ${ZVONOK_ASSISTANT_NAME_PL_TENANT2:-}
+      ZVONOK_BOOKING_PHONE: ${ZVONOK_BOOKING_PHONE_TENANT2:-}
+      ZVONOK_MESSENGER_PHONE: ${ZVONOK_MESSENGER_PHONE_TENANT2:-}
+      ZVONOK_MESSENGER_PHONE_NOTE: ${ZVONOK_MESSENGER_PHONE_NOTE_TENANT2:-}
 
   postgres:
     image: postgres:17-alpine
@@ -157,6 +223,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    # call-api is the ONE service that legitimately needs every tenant's config
+    # — it resolves caller IDs, caps and the extraction key for all of them. The
+    # per-tenant and per-identity variables are suffixed (XAI_API_KEY_TENANT2,
+    # ZVONOK_DAILY_USD_FRIEND, …), so enumerating them here would mean editing
+    # this file every time a tenant or a token is added, and forgetting a line
+    # fails silently by falling back to a default. The explicit block below
+    # still documents what matters and takes precedence over the file.
+    #
+    # Note this is call-api only. A worker must NEVER get the whole file: that
+    # would put every tenant's SIP trunk and voice-brain key in every tenant's
+    # process (see the x-agent-env anchor).
+    env_file:
+      - .env
     environment:
       ZVONOK_DATABASE_URL: postgresql://zvonok:${POSTGRES_PASSWORD}@127.0.0.1:5432/zvonok
       ZVONOK_API_TOKENS: ${ZVONOK_API_TOKENS}

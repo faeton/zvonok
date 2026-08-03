@@ -1,9 +1,17 @@
 # zvonok — a phone-call tool for AI agents
 
-**Status:** phases 0, 1 and 2 complete and verified on live calls; phase 3 (RU/ES benchmarks, cascade profile, IVR/DTMF, retries, cost reconciliation) next (2026-07-27)
+**Status (2026-07-31):** phases 0, 1 and 2 complete and verified on live calls. Phase 3 in progress: Polish added, canvassing mode shipped, **first multi-number canvass ran and returned nothing usable — post-mortem in §9.4**. Inbound trunk and dispatch rule created but nothing answers yet (§5.6).
 **Owner:** faeton
 **Deploy target:** de1 (Hetzner dedicated, Debian, Docker) — see §3 for why
 **Related docs:** [ACCOUNTS.md](./ACCOUNTS.md) (what to register where), [CLAUDE.md](./CLAUDE.md) (session conventions)
+
+> **How to read this document.** §§1–8 state what is true *now*; where an earlier
+> belief was wrong, the statement is simply corrected and the wrong version is not
+> preserved inline. §9 is the log — what was tried, what it cost, and what it
+> taught — and that is the only place archaeology belongs. Corrections layered on
+> top of corrections in the spec is not a style problem: it is how the ASR bug in
+> §9.4 survived for a whole canvass, because §5.3 described a fix the code was not
+> actually making and the description was easier to read than the wire.
 
 ---
 
@@ -160,8 +168,24 @@ Keep **`call_status`** and **`processing_status`** separate: a successfully comp
 - **DTMF:** RFC 2833 / `auto`. Verify early against a real IVR ("press 1 for reception") — task calls die on hotel auto-attendants far more often than on the LLM.
 - **SIP endpoints** (from Zadarma's PJSIP `identify` block — all four are valid signalling sources):
   `sip.zadarma.com`, `sipurifr.zadarma.com`, `sipde.zadarma.com`, `sipuriny.zadarma.com` (+ `pbx.zadarma.com`).
-- **Network block (resolved 2026-07-27, closes open question §10.2):** all five hostnames resolve inside **`185.45.152.0/22`** — a single routed prefix, AS199790 `IPTelecomBulgaria-AS` (Zadarma's carrier network). RDAP shows it split as `185.45.152.0–185.45.153.255` and `185.45.155.0/24`, same holder. Use `185.45.152.0/22` as the firewall scope for 5060 + RTP. Empirically derived, not published by Zadarma — still worth confirming with support before treating as authoritative, and re-check if SIP starts failing after a carrier renumber.
+- **Network block — Zadarma's published list, not our derived one (corrected 2026-07-31).** The six ranges below are what Zadarma states in the *External server (SIP URI)* dialog under a number's settings:
+
+  `185.45.152.0/24` · `185.45.154.0/24` · `185.45.155.0/24` · `195.122.19.0/27` · `31.31.222.192/27` · `15.235.128.64/28`
+
+  We previously used **`185.45.152.0/22`**, derived by resolving their five SIP hostnames and taking the enclosing prefix (AS199790 `IPTelecomBulgaria-AS`). That derivation was not wrong so much as incomplete **in the direction that matters**: outbound only ever talks to the hosts we resolved, so it worked perfectly, while **three of the six ranges above sit outside that /22 entirely** — and inbound is delivered from them. A call to our DID would have been dropped by a default-deny firewall with no log, no carrier-side error and nothing to debug from. The number would simply not ring, which is precisely the symptom we had already spent time chasing.
+
+  Derived-from-DNS is a reasonable way to start and a bad way to stay. Kept in two places that must not drift: `deploy/firewall.sh` (does a packet reach the box) and `ZADARMA_SIP_NETS` in `deploy/lkctl.py` (does livekit-sip believe it). A call needs both.
+
+  **Cross-checked against Zadarma's second, per-IP list** (their Twilio integration guide publishes twelve `/32`s by hostname). All twelve fall inside the six ranges above — so the ranges are a correct superset, not a guess. The same check against the old `185.45.152.0/22` fails on four of them: `pbxlv1/2` (195.122.19.x), `pbxsg1` (15.235.128.70) and `pbxal1` (31.31.222.201).
+
+  For our mode — External Server / SIP URI, no PBX — only **two** of those twelve ever originate an INVITE: `sipurifr.zadarma.com` (185.45.152.216) and `sipuriny.zadarma.com` (185.45.155.33). The other ten are PBX nodes we do not use. Tightening to those two `/32`s would be materially stricter; it is not done because a carrier adding a node would then present as a number that silently stops ringing, which is the failure mode this whole section exists to avoid.
 - **Reference config:** Zadarma's own PJSIP template (endpoint/aor/identify/transport) at their [IP-auth trunk guide](https://zadarma.com/en/support/instructions/asteriskpjsip/trunk/) — this is also the exact config to lift if we ever need the `asterisk-edge` Plan B (§2.2). Note their guide sets caller ID in `extensions.conf` via `Set(CALLERID(num)=…)`; our equivalent is the SIP `From` user, verified working in phase 0.
+- **Before a DID is used for anything, check what kind of number it is.** Added after buying one that could not be dialled. Zadarma's own API answers this in one call — `GET /v1/info/price/?number=<DID>&caller_id=<ours>` returns a `description`, and anything reading **VAS**, *personal number*, *special services*, *premium*, *shared-cost* or *freephone* disqualifies the number for our purposes. Acceptance gate, all four:
+  1. **Geographic range**, per the national regulator's plan — not a service range. A number that is cheap for us to own and expensive for a stranger to dial is the wrong way round: on a callback line, the *caller* pays.
+  2. **Dialable from an ordinary foreign mobile**, tested from outside the country before it is trusted. Carriers decline international service ranges at their own discretion, so "our carrier prices a route to it" is not evidence anyone can reach it.
+  3. **Under our own per-minute cost guard**, or we cannot even test it — see §9.5.
+  4. **Rings through to us**, verified as an INVITE in `livekit-sip` logs, *before* it goes into `ZVONOK_OWNED_CALLER_IDS`.
+
 - **Account hygiene:** check outbound channel limit (standard logins ≈ 3 concurrent), enable auto top-up or balance alerts, disable premium-rate destinations account-side if possible.
 
 ### 5.2 LiveKit stack (Docker on de1)
@@ -184,7 +208,7 @@ Existing input chain: `established,related` accept · `lo` + `tailscale0` accept
 
 Consequence for us: **default-deny means 5060 is already closed**, and livekit-sip on host networking will be unreachable until we explicitly open it. So this is additive, not a policy rewrite:
 
-- 5060/udp+tcp: **accept only from `185.45.152.0/22`** (Zadarma / AS199790 — derivation in §5.1); the drop policy handles everyone else. SIP scanners are constant and this trunk spends real money.
+- 5060/udp+tcp: **accept only from Zadarma's six published ranges** (listed in §5.1); the drop policy handles everyone else. SIP scanners are constant and this trunk spends real money.
 - 10000–20000/udp: same scope. Media comes from the same Zadarma block; widen only if RTP is observed arriving from outside it.
 - ⚠ **Footgun: `/etc/nftables.conf` starts with `flush ruleset`.** A mid-session `systemctl restart nftables` wipes Docker's `iptables-nft` tables (nat/DOCKER chains) until Docker is also restarted. Harmless at boot (ordering works out), destructive at runtime. **Procedure: add rules live with `nft add rule …` AND persist the same lines into `/etc/nftables.conf` separately — never `restart nftables` to pick them up.** If you ever do restart it, restart Docker straight after.
 - Unrelated tidy-up noted while surveying (not ours, not urgent): `0.0.0.0:3334` + `*:8130` (node) and `0.0.0.0:8090` (uwsgi) bind all interfaces and are saved only by the drop policy — no defence in depth if the ruleset ever fails to load. Binding them to loopback or the Tailscale IP would be tidier.
@@ -258,12 +282,17 @@ Fields on `SIPOutboundTrunkInfo`: `name`, `address`, `numbers[]`, `auth_username
 
 ⚠ **The screener rule is counter-intuitive and was learned the hard way.** A screener is not a listener — it records a short label and announces it to the human as *"You have a call from ___"*. A full sentence gets truncated or garbled there, so the human hears nonsense and declines. Give it four words. Everything else — the owner's name, the transcription notice, the question — is wasted at that stage, because **the human hears none of the screener exchange**. When they do come on the line, the agent must **introduce itself again in full**.
 
-**Three distinct silences, three timers.** Conflating them made the agent simultaneously jumpy and slow:
+**Four distinct silences, and they are not interchangeable.** Conflating them made the agent simultaneously jumpy and slow. Canonical values live in `agent/timing.py`, which is the file to read before changing any of them — they interact.
 
-1. `OPENING_SILENCE_SECONDS = 1.5` — nobody spoke after pickup → we open.
-2. `END_OF_TURN_SILENCE_MS = 800` — they spoke and stopped → how long before assuming the turn ended. OpenAI's `server_vad` default of 500 ms is too eager on the phone: a screener says "Hello?" and only *then* "please state your name after the tone", so an eager agent answers the greeting and misses the actual request. Passed via `turn_detection=TurnDetection(type="server_vad", …)` — the xAI plugin does accept it (and `base_url`, despite the docs page omitting both).
+1. `OPENING_SILENCE_SECONDS = 3.0` — nobody spoke after pickup → we **probe**, we do not introduce (§5.3.1). Not 1.5: a callee's "hello" has to cross the PSTN leg, the SIP media path and VAD before we see it, and at 1.5 s we kept talking over people who had already spoken.
+2. `END_OF_TURN_SILENCE_MS = 800` — they spoke and stopped → how long before assuming the turn ended. OpenAI's `server_vad` default of 500 ms is too eager on the phone: a screener says "Hello?" and only *then* "please state your name after the tone", so an eager agent answers the greeting and misses the actual request. Passed via `turn_detection=TurnDetection(type="server_vad", …)`; the xAI plugin accepts it (and `base_url`, despite the docs page omitting both). **This is also the latency floor** — the callee's experienced pause is this plus time-to-first-audio plus egress.
 3. `SILENCE_NUDGE_SECONDS = 6.0`, `MAX_SILENCE_NUDGES = 2` — mid-call dead air → nudge, then give up (~28 s from answer to hangup).
-4. `NO_RESPONSE_BUDGET_SECONDS = 20.0` — absolute cap for a line where the callee has **never** made a sound, measured from answer. A distracted person trips timer 3 and gets the full humane cycle; a line that answered with no media has nobody to nudge, so it is cut without playing an introduction and two nudges into the void.
+4. `QUEUE_PATIENCE_SECONDS = 60.0` / `QUEUE_PATIENCE_TOTAL = 90.0` — a menu has told us to hold, so quiet means *queued*, not *abandoned*: neither nudge nor hang up. The first is refreshed by every menu turn (a switchboard that repeats its announcement keeps the grace alive); the second is measured from when we first started waiting, because otherwise a looping announcement extends the wait forever and only `max_duration` ends the call. One call burned its whole budget that way.
+
+Two absolute budgets bound the call regardless of which silence it is in:
+
+- `NO_RESPONSE_BUDGET_SECONDS = 20.0` — the callee has **never** made a sound, measured from answer. A distracted person trips timer 3 and gets the full humane cycle; a line that answered with no media has nobody to nudge.
+- `NO_SPEECH_BUDGET_SECONDS = 75.0` — nothing **intelligible** has come from the far end. Distinct from the above and necessary because VAD is energy: hold music, a fax tone and a noisy open line satisfy it indefinitely while saying nothing. Only a turn a recogniser was willing to call words counts here.
 
 **Two ways a call must end that aren't `end_call`:**
 
@@ -271,8 +300,7 @@ Fields on `SIPOutboundTrunkInfo`: `name`, `address`, `numbers[]`, `auth_username
 - **Callee hangs up.** The SIP participant leaving does **not** close the room — the agent is still in it. Needs an explicit `participant_disconnected` handler, or the job idles to `max_duration`. Disposition `callee_hangup`.
 
 Operational: `deploy/lkctl.sh rooms` lists live calls, `hangup [room|all]` force-ends one. Written after a stuck job had to be killed by hand.
-- **Language:** always **explicit per call** (`ru`/`en`/`es` to start). No autodetect — it wrecks STT model choice, voice choice, and number/date formatting.
-  - **Refined 2026-07-27 (S2S only).** The rule above exists because autodetect breaks *STT model selection*. A speech-to-speech model has no separate STT, so that reason does not apply to profile A: the call still **opens** in the requested language, but if the callee is plainly speaking another language we support, the agent switches and stays there. For the cascade profile B the original rule stands unchanged — hard-locked, never switch.
+
 - **Audio discipline:** 8 kHz G.711 in/out; resample properly to the model's expected rate; test barge-in on a real phone (target: stop speaking ≤ 300 ms after callee starts; require a short confirmation window to avoid false barge-ins from line noise; commit to history only words actually played).
 - **Answering machines/IVR:** do **not** enable aggressive AMD initially (hotel greetings look like voicemail → false positives). Instead: transcript-pattern recognition + bounded IVR phase (max N menu levels / DTMF presses) before the goal conversation.
 - On session end: write full timestamped transcript (turns with speaker + t_start/t_end) + disposition to call-api; optionally save mixed-audio recording (flag per call, default off until §9 review).
@@ -281,7 +309,70 @@ Operational: `deploy/lkctl.sh rooms` lists live calls, `hangup [room|all]` force
   Order matters: **start the `AgentSession` before dialling** (as an `asyncio.Task`) so the agent doesn't miss the callee's first words on pickup; then `await` the dial, then `ctx.wait_for_participant(identity=…)`.
   Failures raise **`api.TwirpError`**, carrying the real carrier verdict in `e.metadata["sip_status_code"]` / `["sip_status"]` — this is the direct source for our `busy`/`no_answer`/`rejected` terminal states (§4) and for `wait_seconds` fast-fail (§5.5). Log it on every attempt row.
   Hangup = delete the room: `ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))`.
-  In-call tools are plain `@function_tool()` methods on the `Agent` subclass; `end_call` should `await ctx.session.current_speech.wait_for_playout()` first so the agent's goodbye actually reaches the callee before the line drops.
+  In-call tools are plain `@function_tool()` methods on the `Agent` subclass. ⚠ The canonical example has `end_call` `await ctx.session.current_speech.wait_for_playout()` first — **that pattern is invalid in 1.6** and raises on the circular wait (the speech handle waits for the tool to return while the tool waits for playout). Detach a task instead, `await session.wait_for_idle()` bounded, then delete the room: `hangup_after_goodbye()`.
+
+#### 5.3.2 Language and the ASR hint
+
+**Language is always explicit per call** (`ru`/`en`/`es`/`pl`). Never autodetected at the API boundary: it decides the voice, the disclosure wording, number and date formatting, and — see below — what the recogniser is told to expect.
+
+**Grok Voice runs a transcription pass, and it must be configured.** A speech-to-speech model is not "STT-free": there is an ASR in there producing the transcript we store, extract from, and detect voicemail on. `livekit-plugins-xai` hardcodes `AudioTranscription()` — every field `None`, i.e. **automatic language detection** — and exposes no way to set it, so it is set on `_opts` after construction (`agent/voice.py`).
+
+**The field names are xAI's, not OpenAI's.** This is the part worth reading twice:
+
+| What we want | OpenAI SDK field | **What xAI actually reads** |
+|---|---|---|
+| bias ASR to a language | `language` | **`language_hint`** (BCP-47) |
+| bias ASR to proper nouns | `keywords` | **`keyterms`** (max 100 terms, 50 chars each) |
+
+Grok Voice speaks the OpenAI realtime *protocol*, which is not the same as accepting the OpenAI realtime *schema*. `openai.types.realtime.AudioTranscription` is declared `extra="allow"`, so it carries either spelling without complaint, and the realtime server **echoes back whatever keys you send it** — verified against a live session with deliberate nonsense. The wrong names therefore produce no error, no warning, and a `session.updated` frame that reads exactly like confirmation.
+
+⇒ **An echo is not an acknowledgement.** A config field the server never validates has to be checked against behaviour, not against the server's reply. §9.4 is what that cost.
+
+`keyterms` is fed from the `keywords` field on `CallRequest` (the public name stays OpenAI-ish because it is the one clients guess) and biases the recogniser toward the proper nouns a canvass turns on — a drug, a brand, a part number, which is exactly what 8 kHz destroys first.
+
+**`model` is deliberately left unset.** Setting `audio.input.transcription.model` to `grok-transcribe` switches the server to emitting `conversation.item.input_audio_transcription.updated`, which the xAI plugin does not handle — it handles `.completed`, distinguishing partials by a `status` field. Enabling it would silently drop every user transcript: a worse failure than the one it might fix.
+
+**Language switching mid-call is allowed on S2S only.** The call opens in the requested language; if the callee is plainly speaking another language we support, the agent switches and stays there — the commonest thing that happens when a number reaches a real person. Cascade profile B picks a whole STT model from the language and cannot switch mid-call, so there it stays hard-locked.
+
+**Voice model pinned, not aliased.** The plugin default is still `grok-voice-think-fast-1.0`. We run **`grok-voice-think-fast-2.0`** (announced 2026-07-29: 1.5–2x better transcription WER over 24 languages, and a larger claimed margin in noisy telephony — our entire operating condition). `grok-voice-latest` only flips to 2.0 on **2026-08-05**, and an alias that changes under a running deployment is not something to discover from a transcript. `ZVONOK_VOICE_MODEL` overrides.
+
+
+#### 5.3.3 Canvassing mode
+
+A canvass is fifteen numbers, one question, and an answer that is often a single
+word. It is the shape the conversational agent is worst at, and the difference is
+not cosmetic — it is a **different prompt**, selected by `disclosure_level:
+"brief"` (§8.1), not the long prompt with sections switched off.
+
+Why a separate template rather than flags:
+
+- **Prompt length is a latency cost here in a way it is not elsewhere.** A long
+  system prompt normally slows only the first turn, because later turns ride the
+  provider's KV cache. **A canvass is all first turns**: fifteen calls, fifteen
+  cold starts, and the callee sits in the silence for every one of them. The
+  conversational prompt is ~1700 words and carries branches (screeners, bookings,
+  dictating a number back, steering through small talk) a thirty-second stock
+  check never reaches. The canvass prompt is ~560 words.
+- **"Ask everything in the schema" is wrong here.** With five fields it turns a
+  fifteen-second stock check into an interrogation and the callee hangs up
+  mid-way with nothing captured. The **first** schema field is the call; the rest
+  are a bonus. `facts_block(brief=True)` says so explicitly, and the runner
+  reports on the first field.
+- **A short "no" is a complete, successful call.** The agent is told this in as
+  many words, because otherwise it keeps probing after the answer it was sent for.
+- **The first turn is fixed.** Disclosure plus the question, in one breath,
+  whatever the model thinks it heard — the single highest-value use of a fixed
+  utterance on this kind of call.
+
+What is **not** trimmed at any length: the §8 disclosure, admitting to being an AI
+when asked, and honouring a refusal to be transcribed.
+
+`tools/canvass.py` drives a list: stdlib-only, resumable (the idempotency key
+covers the playbook's *content*, so editing the goal and re-running is a new
+request rather than a cached answer), backs off on the concurrency cap rather
+than hammering it, and stops after five consecutive dial failures because that is
+a trunk or balance problem and burning the rest of the list against it helps
+nobody. Playbooks live in `playbooks/`.
 
 ### 5.4 call-api (FastAPI + Postgres)
 
@@ -360,7 +451,7 @@ Thin adapter over call-api (stdio for Claude Code; SSE/HTTP for OpenClaw if pref
 phone_call(
   number: string (E.164),
   goal: string,
-  language: "ru"|"en"|"es",
+  language: "ru"|"en"|"es"|"pl",
   answer_schema?: object,
   caller_id?: string,
   max_duration_seconds?: int = 300,
@@ -416,11 +507,230 @@ depend on a firewall rule or a bearer token staying correct to keep it off the
 internet. Port 18131 rather than 8130 — 8130 was already taken on de1 by an
 unrelated node process, the same collision class that killed the agent on 8081.
 
+### 5.6 Inbound (transport built, nothing answers yet)
+
+Outbound calls create callbacks. Once we have rung fifteen pharmacies, some of
+them ring back — and today that call reaches a number nobody is listening on,
+which is worse than not calling from it at all.
+
+**Built and verified as configuration:**
+
+- A LiveKit **inbound trunk** (`ST_TkZ9U3DYWho4`) scoped to the same six Zadarma
+  ranges the firewall trusts (§5.1). Scoped, not open: 5060 receives constant
+  scanner traffic and an unscoped inbound trunk is an invitation. Refresh it with
+  `lkctl.sh sync-inbound-trunk` — note the SDK's update REPLACES the trunk, so
+  that command copies the existing one and changes a single field rather than
+  silently dropping `numbers` and both server-side fuses.
+- A **dispatch rule** (`SDR_nTzooGvMwHAA`), individual room per call.
+- Zadarma side: the DID sits on the trunk's SIP login. Note the §5.1 warning —
+  activating an IP trunk consumes that login, which is why the Lithuanian DID
+  appeared not to ring at all. **The gap was ours, not the carrier's:** there was
+  no inbound trunk for the INVITE to land on.
+
+`deploy/lkctl.py` gained `inbound-trunks`, `create-inbound-trunk`,
+`dispatch-rules` and `create-inbound-rule` for this.
+
+**Not built, and deliberately not started until the questions below are answered:**
+a `zvonok-secretary` worker, and a `GET /v1/contacts/{number}` history endpoint
+that would tell it who is calling and what we called *them* about.
+
+⚠⚠ **`<lt-did>` (a `+370 700` national number) is the wrong kind of number, and everything below about it is
+plumbing pointed at a dead end.** The routing, the widened firewall, the trunk and
+the dispatch rule are all correct and all stay — they are just aimed at a number
+nobody can dial. Evidence, three independent sources:
+
+- **Zadarma's tariff calls it `Lithuania VAS - mobile`, €0.52/min** to dial.
+- **The Lithuanian regulator classifies `700xxxxx` as a non-geographic *personal
+  number* service** (RRT / ITU +370 plan). Not geographic, not mobile.
+  Shared-cost is `808`, freephone is `800`. Foreign carriers route it at their
+  own discretion and at service rates — Cyta lists `3707` as "Special Services,
+  calls via operator" only; an Austrian carrier prices `+370 7` at €1.25/min.
+- **`GET /v1/statistics/incoming-calls/` shows zero incoming calls all day**, a
+  properly-formed empty result with the window echoed back. The owner's attempts
+  never reached Zadarma, so nothing on our side was ever involved.
+
+And the detail that settles it: **our own outbound test call to it was refused by
+our own spend guard** — Zadarma returned `disposition: "limited by cost"`, the
+account's €0.20/min ceiling declining a €0.52/min destination. We cannot dial our
+own callback number. (It "answers" instantly and drops with no audio, which is
+the phase-0 blocked-call signature in §9.1 — easy to misread as a completed call.)
+
+A callback line where **the caller pays a premium** and many carriers refuse to
+connect is the exact inverse of the requirement. Replace with ordinary
+**geographic** DIDs — Warsaw `+48 22`, Madrid `+34 91`, London `+44 20` — one per
+market we call into, all routed to the same SIP endpoint. The existing UK mobile
+already works for outbound, so the gap is PL and ES.
+
+**Why it did not ring, and what fixed it.** The DID was assigned to **SIP login
+408146** — *the IP-auth trunk login*. Per §5.1, activating an IP trunk consumes
+that login for registered inbound: nothing is registered against it and nothing
+ever will be, so the call arrived somewhere that structurally could not accept
+it. Not the carrier, and not our trunk.
+
+The fix is Zadarma's **External server (SIP URI)** mode on the number:
+
+```
+sip: <lt-did>@<de1 public IP>      # confirmed via GET /v1/direct_numbers/
+```
+
+Zadarma then INVITEs de1 directly and livekit-sip's inbound trunk answers — the
+same shape as the outbound trunk, in the other direction. Settable in the panel
+(*number → External server*), or via `PUT /v1/direct_numbers/set_sip_id/`, whose
+`sip_id` takes either a SIP login or a SIP URI.
+
+⚠ Note the response key is **`info`**, not `numbers` — reading the wrong key
+returns an empty list under `"status": "success"`, which looks exactly like an
+account with no DIDs on it. Same trap as the statistics window in §7.1.
+
+The alternative — attach the DID to the virtual PBX (`pbx.zadarma.com`,
+extension 101) and forward from an incoming-call scenario — is what Zadarma's
+support suggests and it does work, but it puts their PBX in the signalling and
+media path for no benefit we need. **The PBX extension is not part of this
+design; nothing in zvonok registers against it.** It is also why ten of the
+twelve source IPs in §5.1 are irrelevant to us: they are PBX nodes.
+
+**`CALLED_DID` is the header that makes a multi-DID secretary possible.** Zadarma
+puts the virtual number that received the call in a proprietary `CALLED_DID` SIP
+header. That is precisely the key a callback needs — *which of our numbers did
+they dial* — and it is what lets one inbound endpoint serve a Warsaw, a Madrid
+and a London number and still know which campaign the caller is answering.
+Without it, the Request-URI user is the only clue.
+
+That dialog is also where §5.1's corrected network list came from, and enabling
+SIP-URI mode without widening the firewall to match would have produced the same
+non-ringing number for a completely different reason.
+
+⚠ **Still no answerer, and that is a product defect the moment anyone has this
+number.** The dispatch rule names `zvonok-secretary`; no such worker exists.
+livekit-sip answers the INVITE regardless, so an inbound call today reaches
+connected silence — the worst of the options, worse than a dead number and worse
+than carrier voicemail, because "ring, connect, nothing" reads as spam or a
+broken line rather than as a service that is not ready. The trunk's
+`max_call_duration` is pinned to **60 s**, which caps the cost and the rudeness
+without fixing either.
+
+**Why it is nonetheless safe to leave routed right now, and exactly when it stops
+being safe.** Every call we have ever placed went out from the UK DID —
+`SELECT caller_id, count(*) FROM jobs` is 19/19 `<uk-did>`. Nobody has the
+Lithuanian number; it appears in no call log anywhere, so the callback rate is
+not low, it is zero. It is also not in `ZVONOK_OWNED_CALLER_IDS`, so no agent can
+select it.
+
+That changes the day it is used as a caller ID — which is the plan. **The rule,
+therefore: a DID goes into `ZVONOK_OWNED_CALLER_IDS` only once something answers
+it.** The people who ring an unanswered number are precisely the ones we just
+interrupted, and the silence attaches to the number we intend to keep dialling
+them from. That is answer-rate that cannot be bought back, and the cost lands on
+the exact experiment §9.4 exists to re-run.
+
+If inbound must stay unanswered for long, the honest posture is to point the DID
+at carrier voicemail or a real phone rather than at us: a beep is a language
+every adult already speaks.
+
+**The message-taker's minimum bar** (below it, ship carrier voicemail instead —
+a chatty half-agent is not progress): answer promptly and speak; disclose that it
+is an AI and that the message is kept — inbound needs its own §8 wording, not the
+outbound text, because someone returning a missed call did not knowingly dial a
+machine; take a message and a callback number, because caller ID is withheld,
+shared or spoofed often enough to be useless as the only route back; say plainly
+what happens next and do not promise a call back with an answer unless a human
+will actually make it; and **deliver the message somewhere a person will see it**.
+A transcript nobody reads is strictly worse than a voicemail box on a phone that
+buzzes.
+
+**Scope note for when it is built:** `GET /v1/contacts/{number}` is
+identity-scoped, which is right for an agent asking "did *I* already ring this
+pharmacy". It is the wrong boundary for a secretary: a callback lands on a shared
+DID, so an identity-scoped lookup would miss the outbound call that caused it and
+route at random. The secretary needs tenant- or DID-scoped history — a deliberate
+widening, decided once, and still never recited to the caller.
+
+Three constraints that must be settled before any of that is written, because
+each is a way to build the wrong thing convincingly:
+
+1. **Caller ID is a hint, not authentication.** It is trivially spoofable. The
+   history endpoint therefore must never let an inbound caller hear another
+   person's call history — the failure mode of "we called you about X" when the
+   number was spoofed is disclosing our outbound activity to a stranger. Match on
+   caller ID to *route*, never to *authorise*.
+2. **Unknown callers need a defined behaviour**, and it is the common case: most
+   numbers that ring us will never have been dialled by us.
+3. **Disclosure on inbound is a different question from outbound.** §8's wording
+   assumes we initiated the call and the callee did not choose to speak to a
+   machine. Someone who rings a number back has arguably chosen differently — but
+   not knowingly, and that distinction has to be made deliberately rather than by
+   reusing the outbound text because it exists.
+
+### 5.7 Tenancy model (added 2026-07-31, branch `multi-tenant` — rationale in §9.7)
+
+One box, more than one billing account. Two scopes, and conflating them is the
+mistake the whole design exists to prevent:
+
+| | **Tenant** | **Identity** |
+|---|---|---|
+| Is | a billing account | one bearer token = one client agent |
+| Owns | SIP trunk, verified DIDs, xAI key, its own agent worker | daily caps, audit trail, idempotency scope |
+| Env suffix | `_<TENANT>` — `XAI_API_KEY_TENANT2` | `_<IDENTITY>` — `ZVONOK_DAILY_USD_FRIEND` |
+| Cardinality | 1..n identities belong to it | belongs to exactly one tenant |
+
+`mac-claude` and `openclaw` are two identities of one tenant: separate budgets,
+one Zadarma account. An unsuffixed variable *is* the default tenant's, so a
+single-tenant deployment is a one-tenant deployment with nothing to configure.
+
+**Routing.** Each tenant runs its own voice worker registered under its own
+`agent_name`; `dispatch_call` selects it. That name is the *only* tenant-specific
+value crossing into LiveKit — deliberately, because dispatch metadata is
+persisted in Redis and appears in logs, so trunk ids and API keys must never
+travel that way. The worker's own env holds those. Consequence worth stating
+plainly: **`agent_name` is the whole isolation mechanism for placing a call**,
+which is why a duplicate is fatal at startup rather than a warning (§9.7 trap 1).
+
+**Inheritance is not uniform, and the split is load-bearing.** Account-identifying
+values (`XAI_API_KEY`, `ZVONOK_AGENT_NAME`, the three caller-ID variables) do
+**not** fall back to the unsuffixed variable for an added tenant — `config._own`.
+Operational ones (base URL, extractor model, caps) do — `config._scoped`. A
+forgotten key that quietly resolved to the *other* tenant's would bill the wrong
+person; forgotten DIDs would let one tenant dial out as the other. Both failures
+are silent — the call connects and sounds normal — so they are made unreachable
+by configuration error rather than merely discouraged.
+
+**What is isolated:** caller ID and trunk (per tenant), extraction key (per
+tenant), spend caps and audit (per identity), API reads (per identity — `_job_or_404`
+404s across identities), the same-number-in-flight 409 (per tenant: two
+identities of one account are one caller to the callee; across accounts it would
+be a false conflict *and* would disclose the other tenant's target), and the
+worker callbacks — `ZVONOK_INTERNAL_TOKEN` is **per tenant** and does not
+inherit, so the internal endpoints know not merely that *a* worker is reporting
+but *whose*.
+
+**A job's tenant is stored, not re-derived.** `jobs.tenant` is written at
+admission and read by everything downstream (`Settings.tenant_of`). Dispatch
+already fixes the trunk and the caller ID when the call is placed; this makes
+the accounting equally immutable. Without it, editing `ZVONOK_TENANT_<IDENTITY>`
+— or dropping the mapping while jobs were still unextracted — moved extraction,
+`/reextract` and the janitor's disk recovery onto the *new* mapping, so one
+tenant's transcript was read by, and billed to, another tenant's xAI key. The
+already-created LiveKit dispatch keeps its original agent name, so no in-flight
+PSTN leg reroutes: it is the money and the transcript that move, silently. Rows
+written before the column fall back to the derived answer, which is what they
+had anyway — the identity→tenant mapping lives in env, so SQL cannot backfill
+them.
+
+**What is not, and cannot be without a second LiveKit and a second Postgres:**
+`LIVEKIT_API_KEY` (room admin — a tenant's worker can in principle join another's
+room, and trunk ids are not secret to anything holding it), the jobs database,
+the transcript directory. This is **co-located
+multi-account with a soft trust boundary**, not tenant isolation: correct for
+people who know each other, not for strangers. Hosting a third party also makes
+the operator a processor for their callees' voice data under their own retention
+policy.
+
 ---
 
 ## 6. Security & guardrails (this is a spend-capable actuator)
 
 - **AuthN/Z:** bearer tokens per client identity (mac-claude, openclaw, manual); Caddy TLS; tokens in env/secret files, never in repo.
+- **Tenancy (§5.7):** an identity belongs to a billing account. Caller IDs, SIP trunk and extraction key are per *tenant*; caps and audit per *identity*. Account-identifying config never inherits — a forgotten variable fails startup rather than resolving to another account's key or numbers. What stays shared (LiveKit room admin, Postgres, transcripts) makes this a soft boundary: safe for people who know each other, not for strangers.
 - **Destination policy:** default-deny list: premium-rate prefixes, emergency numbers (112/999/911/…), satellite, unknown country codes. Allowlist of destination countries (start: ES, GB, UA, PL, DE, FR, IT, CH, SA, IN, NP, AE).
 - **Caps:** per-call max duration (default 300 s, hard 600 s); per-identity daily minutes + daily call count; global concurrency 1–2 (Zadarma login limit ≈ 3 anyway); daily spend estimate cutoff.
 - **Idempotency:** required key on POST /calls — an agent retry must not double-dial a restaurant.
@@ -457,28 +767,35 @@ First real measurement (2026-07-27, 13 rows on our trunk): total **€0.0462**. 
 ## 8. Legal & etiquette (EU/UK, not legal advice)
 
 - Recording/transcribing calls = processing personal data (GDPR); UK ICO expects disclosure of recording and purpose.
-- Baseline built into the agent prompt: **discloses it's an AI assistant, on whose behalf, and that the answer is being kept** — at call start, every call. If the callee objects: apologize, end, and **discard the transcript** (implemented: `declined` writes a minimal audit record with no turns).
+- Baseline built into the agent prompt, at call start, on every call: **it is an AI assistant, and the answer is being kept.** Those two facts are non-negotiable at every level. *On whose behalf* is stated at `light` and `full` and deliberately omitted at `brief` — see §8.1. If the callee objects: apologise, end, and **discard the transcript** (implemented: `declined` writes a minimal audit record with no turns).
 
-#### 8.1 Two disclosure levels (decided 2026-07-27)
+#### 8.1 Three disclosure levels
 
 **"I am an AI" and "your words are being kept" are different disclosures, and the first does not imply the second.** Knowing you are talking to a machine tells you nothing about retention — a caller can reasonably assume an AI handles the call transiently, like a voice menu. We retain transcripts, so the storage fact must be stated. What is negotiable is the *register*, not the content:
 
 | Level | Wording | When |
 |---|---|---|
+| **`brief`** | *"Hello, this is an AI assistant, I'll note the answer down. <question>"* | One-question canvassing: ringing 15 pharmacies for a drug, shops for a part |
 | **`light`** (default) | *"This is Klava, an AI assistant calling for <owner>. I'll note down your answer so nothing gets lost."* | Ordinary information-gathering calls |
 | **`full`** | *"… This call is transcribed and stored. If you would rather it were not, say so and I'll end the call."* | Two-party-consent jurisdictions; anything that books or commits on someone's behalf |
 
-Rationale for `light` being the default: "this call is recorded" is call-centre boilerplate that people hear as surveillance, and it frightens them into hanging up before the goal is reached. It is also **less accurate than it sounds** — we keep *text*, not audio (§5.3 has audio recording off by default), so "I'll note down your answer" describes what actually happens and is what a human receptionist would say. Both levels state the storage fact; `full` adds explicit transcribe-and-store wording plus an offer to stop.
+**`brief` is a conversation mode, not just a shorter sentence.** The same knob — how much ceremony this call can afford — moves both, so it is one field rather than two. See §5.3.3 for what else it changes.
 
-Selected per call via `disclosure_level` in the dispatch metadata (and, from phase 2, by a **policy table keyed on destination country and task type** — the same table §8 already calls for). Unknown values fall back to `light`.
+**`brief` is a genuine thinning of §8, not merely a change of register.** State it plainly: it discloses the AI fact and the retention fact, **and nothing else — no principal, no personal name.** Both omissions were learned on the first Polish canvass. The owner framing ("calling for a potential client") costs three seconds in front of the question and means nothing to a counter clerk who has never heard of them; a name nobody recognises invites *"Klawa? which Klawa?"* instead of an answer.
 
-Enforcement is not left to the model: `disclosure_delivered()` requires the assistant name, the owner, an AI self-identification **and** a storage word to appear in a single uninterrupted turn. A turn shredded by barge-in does not count, and neither does an introduction that names the AI but omits the retention. Failing that, `disclosure_guard` speaks the canonical text verbatim with `allow_interruptions=False`.
+Two consequences follow, and both are load-bearing:
 
-⚠ **That "uninterrupted" requirement was claimed before it was true.** The function
-documented it and never checked the flag — it matched substrings on any assistant
-turn, so a shredded introduction still counted as delivered, which is precisely
-the phase-1 failure the guard exists to prevent. Fixed once turns began carrying
-`interrupted` (phase 2); there is now a test for it.
+- `disclosure_delivered()` drops its **name** requirement at this level. Leaving it in would have `disclosure_guard` conclude the disclosure never landed and cut across the callee to repeat a line they had already heard — the exact failure the guard exists to prevent.
+- `brief` is **never selected by the heuristic**, only by an explicit `disclosure_level`, *and* it is refused where the goal commits something. Shortening a disclosure must be a decision made by an agent that knows the call is a one-question canvass; the country table knows only where the call is going. And `policy.disclosure_level_for()` upgrades `brief` to `full` when the goal contains commitment words — nobody books, orders or cancels in someone's name behind the shortest disclosure we have. The asymmetry is deliberate: a caller may always ask for **more** disclosure than we would choose, never less than the goal warrants.
+
+Rationale for `light` being the default: "this call is recorded" is call-centre boilerplate that people hear as surveillance, and it frightens them into hanging up before the goal is reached. It is also **less accurate than it sounds** — we keep *text*, not audio (audio recording is off by default), so "I'll note down your answer" describes what actually happens and is what a human receptionist would say.
+
+Selected per call via `disclosure_level` in the dispatch metadata, or by a **policy table keyed on destination country and task type**. Unknown values fall back to `light`.
+
+**Enforcement is not left to the model.** `disclosure_delivered()` requires an AI self-identification **and** a storage word in a **single uninterrupted turn**, plus — at `light` and `full` only — the assistant's name. A turn shredded by barge-in does not count, and neither does an introduction that names the AI but omits the retention. Failing that, `disclosure_guard` speaks the canonical text verbatim with `allow_interruptions=False`.
+
+The `interrupted` check is the part that makes that claim true rather than merely documented: for a while the function described the requirement and never checked the flag, matching substrings on any assistant turn — so a shredded introduction still counted as delivered, which is precisely the phase-1 failure the guard exists to prevent. There is now a test for it (`test_policy.py`).
+
 
 #### 8.2 `declined` is evidence-gated, not model-asserted (learned 2026-07-27, phase-2 acceptance)
 
@@ -512,9 +829,11 @@ Not legal advice — worth a real review before calling businesses across many j
 
 ---
 
-## 9. Rollout plan
+## 9. Rollout and findings log
 
-### Phase 0 — trunk validation (~1 hour, no code)
+This is the archaeology. Everything above states what is true now; this states what was tried, what it cost, and what it taught.
+
+### 9.1 Phase 0 — trunk validation (~1 hour, no code)
 Softphone or bare `pjsua`/Asterisk container on de1 → Zadarma IP-auth trunk → call own mobile.
 **Verify:** outbound works, chosen caller-ID displays correctly per DID, two-way audio, DTMF to a real IVR, clean hangup both directions.
 **Gate:** this is the only real experiment in the project; everything above it is conventional app code. If interop is ugly → deploy `asterisk-edge` per Zadarma's PJSIP manual and put LiveKit behind it.
@@ -530,7 +849,7 @@ Softphone or bare `pjsua`/Asterisk container on de1 → Zadarma IP-auth trunk �
 - Zadarma API works (keys on de1: `~/zvonok-p0/zadarma-api.env`, helper `zadarma_api.py` — balance, price, DIDs, tariff). Note: API keys require e-mail confirmation link on creation. Tariff "Standard" `is_active:false` is harmless (period activates on any top-up, 30-day window); Standard (per-second) chosen over Economy (per-minute) — right call for 1–3 min agent calls.
 - Zadarma's own "AI voice agent" (2026) is inbound-only, PBX-bound, no outbound-call API — confirms this product gap; irrelevant to our stack (maybe phase-4 inbound secretary).
 
-### Phase 1 — first AI call (a weekend)
+### 9.2 Phase 1 — first AI call (a weekend)
 Compose up redis + livekit-server + livekit-sip; create the Zadarma outbound trunk; minimal Python agent (Grok Voice, hardcoded goal); trigger by dispatching with metadata.
 **Acceptance:** my phone rings from my UK DID, agent converses toward a hardcoded goal in English, transcript lands in a file.
 
@@ -560,7 +879,7 @@ Bugs found and fixed during the acceptance run (all ours, none in the stack):
 - Tooling note: de1 has no `lk` CLI and doesn't need one — `deploy/lkctl.py` drives trunk creation and dispatch through the `livekit-api` SDK already present in the agent image (`deploy/lkctl.sh` runs it in that image). Prefer the non-deprecated SDK names `list_outbound_trunk` / `create_outbound_trunk`.
 - Still unproven until the first dial: whether `instructions` actually reach Grok Voice (§10.6), DTMF against a real IVR, and barge-in behaviour.
 
-#### Phase-1 hardening pass (2026-07-27, after independent Codex + Grok reviews)
+#### 9.2.1 Phase-1 hardening pass (2026-07-27, after independent Codex + Grok reviews)
 
 Two independent reviews of the phase-1 code and design. Both were worth it: between them they found one design flaw that explained an observed bug better than our own hypothesis, three P0 lifecycle/money defects, and one implementation that contradicted a promise made out loud to a callee.
 
@@ -587,7 +906,7 @@ Grok also rejected "tell the model to repeat numbers back" as a control: a conve
 
 **Not adopted (deliberately).** Grok argued for a hard `classify_answerer` gate before any goal speech. Deferred: the probe-not-introduce fix removes the mechanism that caused the bug, and a mandatory extra tool round-trip on every call costs latency on the common path. Revisit if voicemail slips through again.
 
-### Phase 2 — the product spine
+### 9.3 Phase 2 — the product spine
 call-api (endpoints, state machine, Postgres), extractor pass, MCP server, caps/allowlists, idempotency, `wait_seconds` fast-fail.
 **Acceptance:** from a Claude Code session: `phone_call(my number, test goal)` → poll → structured answers. OpenClaw gets its token.
 
@@ -680,22 +999,281 @@ challenge by design, and the extractor caught the unconfirmed values anyway, so
 it degraded safely). Webhook delivery, the `retention_days` purge, and busy/no-answer
 retries are written or configured but not exercised.
 
-### Phase 3 — reality hardening
+### 9.4 The first canvass (2026-07-31) — post-mortem
+
+**What was run.** 15 pharmacies in Warsaw's Mokotów district, Polish, `brief`
+disclosure, one question ("do you have Ozempic 2 mg in stock?") with a fallback
+about dispensing 1 mg against a 2 mg prescription. Two concurrent, ~120 s cap,
+**~$1.64 total**.
+
+**What came back: nothing usable.** Zero answers about the drug.
+
+**The SIP layer's own tally**, which is worth more than our transcripts because
+it is independent of the agent that was mishearing everything:
+
+| | |
+|---|---|
+| dialled | 15 |
+| never answered (`480 Temporarily unavailable`, after ringing) | 6 |
+| answered | 9 |
+| … of those, ended by the far end (`BYE`) | 6 |
+| … of those, ended by us (room deleted: voicemail, IVR dead-end, cap) | 3 |
+
+Ring time before pickup ranges from **1.4 s to 22.5 s**, and that spread is
+itself a signal: the three numbers answering in under 1.5 s are an auto-attendant
+picking up instantly, not a person reaching for a handset. Nine answers, six of
+which the other end terminated, is the entire evidential basis for anything said
+about how businesses react — and six of the fifteen numbers never even rang
+through to a human on a weekday afternoon.
+
+**The experiment was invalid, and it took two reviews and a protocol probe to see
+why.** Ranked by how much each one could have produced this result on its own:
+
+1. **The ASR was never told what language it was listening to.** The fix believed
+   to be in place was sending `language`/`keywords`; xAI reads
+   `language_hint`/`keyterms` (§5.3.2). The server echoed the wrong keys back, so
+   every log and every `session.updated` frame agreed the pin was applied. It was
+   not. **All fifteen calls ran on automatic language detection**, which is
+   weakest in exactly the first second — the second that decides the call. And
+   `Ozempic` / `semaglutyd`, the words the entire canvass turned on, never reached
+   the recogniser at all.
+2. **A greeting misheard is not a transcript defect — it redirects the call.** Two
+   observed instances: `"Apteka X, słucham?"` came back as the English *"I think I
+   look to the."*, and `"How to take a pressure?"` — which the model then
+   **answered**, giving a pharmacy instructions on using a blood-pressure cuff
+   instead of asking about the drug.
+3. **That same hallucination was then classified as an IVR menu**, because
+   `"press" in text` also matches `"pressure"`, and it bought sixty seconds of
+   patient silence on a line where nobody had said anything of the sort.
+4. **We rang Polish pharmacies from a UK mobile number.** Both reviewers
+   independently named this the single largest untested variable, and it is the
+   only one we have not eliminated.
+5. **The model was upgraded 1.0 → 2.0 in the same change as the language pin.** So
+   the transcription improvement that was observed is attributable *entirely* to
+   the model — the pin was doing nothing. Two variables, one measurement, and the
+   conclusion drawn from it was wrong.
+
+**A wrong diagnosis worth recording, because it wasted a day.** The agent was
+reported as taking nine seconds to reply. It was not: the claim came from
+transcript `t` values, which are stamped when a turn is **transcribed**, not when
+it was heard or spoken. The real local gap is on the order of 3.5–4 s. There is
+now a direct measurement (`reply gap`, callee-stops-talking → our audio starts,
+logged alongside model `ttft`), and its docstring says exactly what it excludes,
+because the previous version of that log claimed to include the end-of-turn wait
+and did not.
+
+**What this does NOT license concluding.** That businesses hang up on an AI
+caller. **n = 6** under broken conditions is not a finding, and there is a
+competing explanation for every one of those six. It also does not license the
+opposite: a shortage drug is a plausible thing to be short with any caller about.
+
+**The clean re-run, when it happens:** the same fifteen numbers, the ASR fix in
+place, **a Polish caller ID**, and nothing else changed. Two variables have
+already been confounded once in this experiment; a third would make the result
+uninterpretable again. The metric is *"a human stayed on the line as far as the
+product question"*, not *"the call connected"* — the latter is what made this run
+look like a product verdict when it was an instrumentation failure.
+
+### 9.5 Phase 3 — reality hardening (in progress)
 RU/ES language profiles benchmarked on real 8 kHz calls; cascade profile B wired and selectable; IVR bounded-navigation + DTMF; retry policy (busy/no-answer); webhooks; cost accounting; SIP-TLS/SRTP `require`; caller-ID-per-country table.
 
-### Phase 4 — optional/later
+### 9.6 Phase 4 — optional/later
 Inbound (separate SIP login + dispatch rules → "secretary" agent), human-transfer to my mobile, recordings (post §8 review), archival sync of transcripts to n5, second trunk (Telnyx) for HD/SIP-diversity, admin mini-UI.
+
+### 9.7 Phase 5 — multi-tenancy (2026-07-31, branch `multi-tenant`)
+
+**Trigger.** "Can my friend's calls run on my box?" The answer that mattered was
+the follow-up: *he has his own Zadarma account and his own xAI key*. That turns
+the problem from multi-tenant SaaS — which needs per-tenant trunks, billing, KYC
+and an abuse process, and makes the operator a telecom reseller — into
+**two isolated accounts co-located on one host**, which the existing design was
+already most of the way toward. Spec in §5.7.
+
+**What was already true and did not need building.** `identity` was a first-class
+column from phase 2, `_job_or_404` already enforced read isolation across
+identities, idempotency was already scoped per identity, and spend counters were
+already keyed `(day, identity)`. The gap was never the data model; it was that
+everything *account-shaped* — caller IDs, the xAI key, the trunk — was
+module-level or process-level global.
+
+**Decisions taken:**
+
+- **One worker per tenant, routed by `agent_name`.** Rejected: passing per-call
+  credentials through dispatch metadata (it is persisted in Redis and logged —
+  the rule `dispatch.py` already stated), and a per-call trunk lookup in the
+  agent (would put every tenant's trunk in every tenant's process). A separate
+  worker gets trunk, voice key and spoken identity from its own env for free.
+- **Env suffixes rather than a config file.** Keeps "secrets in env on de1 only"
+  (§6) intact and makes a single-tenant deployment configure to exactly what it
+  was. Cost: two suffix namespaces to keep aligned; both reviewers called this a
+  poor 1am interface and they are right — §10 item 12.
+- **Caller-ID policy became a value (`policy.CallerIds`), not module state.**
+  The module-level `OWNED_CALLER_IDS` frozenset was the single largest blocker:
+  one process cannot serve two accounts while the verified-DID list is global.
+- **Compose: `env_file` for call-api only.** It is the one service that
+  legitimately needs every tenant's config; enumerating arbitrary suffixes would
+  fail *silently* when a line is forgotten. Workers deliberately do not get it.
+
+**Traps, and how they landed.** Items 1–3 were found by writing the tests, 4–8 by
+Codex and Grok reviewing the branch. Six of the eight are the same shape: a
+misconfiguration that produces a working call billed to the wrong person.
+
+| # | Trap | Outcome |
+|---|---|---|
+| 1 | **Account values inheriting from the unsuffixed variable.** A forgotten `XAI_API_KEY_TENANT2` resolved to the default tenant's key; forgotten DIDs let the added tenant present the default tenant's numbers — i.e. exactly what the change existed to prevent. | `_own` vs `_scoped` split; fatal at startup. Caught by the config test, not by review. |
+| 2 | **Empty ≠ absent.** docker-compose passes an unconfigured variable as `""`, which `os.getenv(name, default)` treats as *present*. | Empty-as-absent at both lookup levels. Also fixed pre-existing `_int`/`_float`, where `ZVONOK_MAX_CONCURRENT_CALLS=""` crashed call-api at import. |
+| 3 | **A nameless worker accepts every tenant's jobs.** Same empty-string path, but in the agent: an empty `agent_name` disables explicit dispatch entirely. | `SystemExit` on set-but-empty; unset still means the single-tenant default. Same guard for an empty trunk id. |
+| 4 | **Duplicate `agent_name` was only a warning.** LiveKit hands each dispatch to whichever worker is free, so ~half of one tenant's calls leave on the other's trunk, with the other's caller ID, billed to the other's balance. Nothing looks wrong. | Fatal in `require()`. This was inconsistent with a missing key already being fatal — the more expensive error was the more forgiving one. |
+| 5 | **Whitespace defeated that fix.** The API compared names verbatim; the worker `.strip()`s before registering. `" zvonok-caller "` and `"zvonok-caller"` pass the uniqueness check and collide at LiveKit. | Config strips to match the worker. |
+| 6 | **`_suffix()` is not injective.** It collapses punctuation runs, so identities `friend-a` and `friend_a` read the same `ZVONOK_TENANT_*` and the same caps — separate in `ZVONOK_API_TOKENS`, one budget and one account in effect. | Canonical suffix collisions are fatal, for identities and tenants. |
+| 7 | **Caller-ID config was fail-open**, while `.env.example` claimed it failed startup. Empty DIDs → the trunk default is presented and everything prices as the expensive origin group. | Fatal for added tenants, plus a check that a tenant's default DID is on its own verified list. Default tenant's requirements untouched, so existing deploys are unaffected. |
+| 8 | **`/healthz` was unauthenticated and listed every in-flight job id.** A bare count is still activity: polled on a timer it says when the other tenant is on the phone and for how long. | Liveness and static config only. |
+
+**Defence in depth.** The worker re-checks any caller ID the API hands it against
+its own `ZVONOK_OWNED_CALLER_IDS` and falls back to the trunk default rather than
+failing the call — the number is wrong, not the request, and the trunk's own
+default is by definition a DID of the right account. Reaching that branch means
+call-api routed a job to the wrong worker, so it logs loudly.
+
+**Verified.** `docker compose config` renders identically with no profile (an
+existing `.env` needs no edits); the profile adds exactly one service.
+`api/tests/test_policy.py` covers tenant isolation and config resolution — 23
+assertions in the config test alone. Not verified: a real second Zadarma account
+placing a real call. **This has not been run with two live tenants.**
+
+**Both reviewers' findings are now closed** (2026-08-03): the internal token is
+per tenant and `jobs.tenant` is stored at admission — see §5.7. Both were
+pre-existing designs that multi-tenancy made exploitable rather than new
+defects, which is why they were worth fixing before a second account exists
+rather than after. What remains open is the ergonomics of the env-suffix
+interface, §10 item 10.
+
+**Operational note for the second trunk:** it must use **SIP credential auth**,
+not IP auth. Ours is authorised by de1's static IP; if a second Zadarma account
+whitelists the same IP, two accounts claim one source and which one is billed is
+not a thing to learn from an invoice.
 
 ---
 
 ## 10. Open questions
 
-1. Grok Voice quality for **Russian** and **Spanish** over 8 kHz — benchmark early (phase 3 gate for profile default per language).
-2. ~~Zadarma IP ranges for firewall scoping~~ — **resolved 2026-07-27: `185.45.152.0/22` (AS199790)**, derived by DNS+RDAP (§5.1). Confirm with support opportunistically; not a blocker.
-3. Exact Zadarma per-login concurrent-channel limit on our tariff. (DIDs report 2 channels each; trunk login unknown.)
-4. ~~Whether OpenClaw consumes MCP directly or prefers a plain REST skill~~ — **resolved 2026-07-27: both exist, OpenClaw picks.** The MCP server is a thin adapter holding no state and enforcing nothing; policy, caps, idempotency and audit all live in call-api, so a client that prefers plain REST bypasses no guardrail. OpenClaw has its own identity/token either way.
-5. ~~xAI realtime access~~ — **resolved 2026-07-27: confirmed working** on our key (`grok-voice-latest`, audio modality, §5.3). Still unverified: concurrency limit and per-minute billing rate on our tier — the $0.05/min figure in §7 is from public docs, not from our invoice. Check after the first real calls.
-6. **New:** does the pinned `livekit-plugins-xai` actually honour `instructions`? (§5.3 gotcha.) Must be proven on call #1 — everything downstream assumes the system prompt lands.
+Resolved items are not kept here — they have been folded into the sections above.
+
+**Blocking the next real experiment:**
+
+1. **Geographic DIDs for the markets we call: Warsaw `+48 22`, Madrid `+34 91`.**
+   Two purchases, and they unblock two separate things at once — §9.4's re-run
+   needs a Polish caller ID as its only remaining uncontrolled variable, and §5.6
+   needs a number that ordinary phones can actually ring back. Caller ID is also
+   a *cost* lever, not merely an answer-rate one (§9.1 measured a x20–34 origin
+   swing on EU routes). Both must pass the §5.1 acceptance gate before use.
+
+   ⚠ The claim that a matching-country caller ID **raises answer rates** is
+   assumed, not measured. Phase 0 measured *pricing*, never pickup. Buy them for
+   the cost and the callback path, and treat any answer-rate improvement as a
+   hypothesis the re-run is testing rather than a reason it will work.
+2. **Does `language_hint` measurably change what comes back?** The plumbing is
+   settled — the options the plugin builds serialise to
+   `session.audio.input.transcription = {"language_hint": "pl", "keyterms": [...]}`,
+   dumped from the real object inside the deployed container, so it is on the
+   wire in xAI's field names. What is *not* settled is whether the server acts on
+   it, and it cannot be settled from the protocol: the schema is not validated
+   server-side and unknown keys are echoed back unchanged. The only proof is
+   behavioural — the same Polish audio, hint on vs hint off, transcripts
+   compared. Cheap, and it is exactly the check whose absence caused §9.4.
+
+   **Measured 2026-07-31, and the answer so far is "no effect we can detect."**
+   `tools/asr_probe.py` streams a WAV straight at the realtime API, bypassing
+   LiveKit so nothing in between can introduce or hide a difference. Twenty arms
+   over real 8 kHz PSTN audio (the Spanish voicemail leg): clip lengths 60 s /
+   2 s / 1 s, SNR clean / 5 / 0 / −6 dB, hints `off` / `es` / `pl` / `ru`, plus
+   the OpenAI spelling `language` as a negative control. **Every arm returned an
+   identical, correct Spanish transcript** — including a deliberately wrong
+   Polish hint on one second of speech buried under noise louder than the
+   signal.
+
+   This does **not** license "xAI ignores `language_hint`", and both reviewers
+   said so independently: a hint is a soft prior, and a recogniser that honours
+   it can still be overridden by decisive acoustic evidence, so `hint=pl` ==
+   `hint=off` is the expected result either way. What it does license is
+   refusing to *assume* the opposite. §9.4 ranked "the ASR was never told what
+   language it was listening to" as root cause #1 of the failed canvass; that
+   ranking now rests on nothing measured, and the untested `keyterms` half of
+   the same fix is the more product-critical one anyway — a canvass turns on
+   whether `Ozempic` and `semaglutyd` survive 8 kHz, not on language ID.
+
+   ⇒ **Next is `keyterms`, not more `language_hint`.** It is the sharper probe
+   because it is near-binary: a rare proper noun either appears in the
+   transcript or it does not, where a language hint has to out-argue the
+   acoustics. Needs audio containing a low-prior proper noun that the unhinted
+   arm gets wrong — which we do not have, because audio recording is off by
+   default and no Polish call was ever captured. Recording one leg of the
+   re-run, once, is what unblocks this.
+
+   Two probe bugs found while building it, both of which manufacture a
+   convincing null and are worth knowing about for any future protocol probe:
+   streaming audio before `session.updated` arrives (the decisive first second
+   decodes under defaults), and ending a clip by *stopping transmission* rather
+   than sending trailing silence — server VAD never sees an end-of-turn, never
+   commits the segment, and the arm scores zero as if the recogniser heard
+   nothing. Nine arms scored zero that way before it was caught.
+3. **What the reply gap actually is.** Instrumentation is deployed and has never
+   run against a live call. Everything said about this agent's latency so far has
+   been inferred from the wrong timestamps.
+4. **Does the inbound 60 s fuse actually fire on the wire?** It is configured on
+   the trunk and has never been observed ending a call. If it does not fire, the
+   silence is unbounded rather than merely rude. One test call answers it — and
+   the same call is the only proof that inbound transport works at all.
+
+**Derived rather than confirmed, and load-bearing.** §5.1's firewall scope was
+exactly this shape — outbound-proven, inbound-wrong, silent when it failed — so
+the class is worth listing rather than trusting:
+
+- **RTP source ranges are assumed to equal the six SIP ranges.** Never observed
+  under real answered inbound media; if media comes from elsewhere the symptom is
+  one-way audio, not an error.
+- **Per-login concurrent channel limit** is still unknown (§10.7). Inbound makes
+  exhaustion a product bug rather than a footnote: a callback sitting in silence
+  can occupy a channel an outbound call needed.
+- **Inbound tariff.** Outbound origin pricing was measured carefully (§9.1);
+  what our own DIDs cost to *receive* was never established.
+- **Two allowlists, one fact.** `deploy/firewall.sh` and `ZADARMA_SIP_NETS` in
+  `deploy/lkctl.py` must agree and are maintained separately. Drift fails closed
+  (a number stops ringing) unless someone widens 5060 while debugging, which
+  fails open.
+
+**Design decisions owed before code is written:**
+
+4. **Inbound behaviour** — the three constraints in §5.6 (caller ID is not
+   authentication; unknown callers are the common case; inbound disclosure is a
+   different question from outbound).
+5. **Question-first opener for canvassing.** Proposed: *"Dzień dobry, czy mają
+   Państwo Ozempic 2 mg? Tu asystent AI — tylko zanotuję odpowiedź."* Both §8
+   facts still land in the same breath, before the callee answers, but the first
+   thing they hear is an ordinary question about stock rather than the word
+   "robot". This is a deliberate compliance trade and needs an explicit decision,
+   not a quiet prompt edit.
+
+**Standing / not blocking:**
+
+6. Grok Voice quality for **Russian** and **Spanish** over 8 kHz — benchmark
+   before making either the per-language default.
+7. Exact Zadarma per-login concurrent-channel limit on our tariff. (DIDs report 2
+   channels each; the trunk login is unknown.)
+8. xAI **concurrency limit and actual per-minute billing** on our tier. The
+   $0.05/min in §7 is a public list price, not a figure from our invoice.
+9. `mcp>=2.0` renames `mcp.server.fastmcp` to `mcp.server.mcpserver`, which breaks
+   `mcp/server.py`. Pinned to `<2` for now; migrate deliberately rather than
+   discovering it on a client upgrade.
+
+**Owed before a second tenant places a real call:**
+
+10. **The env-suffix interface is poor for humans.** Two suffix namespaces
+    (`_<TENANT>` for accounts, `_<IDENTITY>` for caps) plus a compose profile
+    name that must stay aligned with the tenant name. Both reviewers said the
+    same thing unprompted. Options: a tenants file with env for secrets only, or
+    generate the per-tenant compose service. Not urgent at two tenants; it is the
+    thing that will bite at three.
 
 ## 11. In-house prior art (found 2026-07-27)
 

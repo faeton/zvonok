@@ -112,6 +112,36 @@ async def get_job(job_id: str) -> asyncpg.Record | None:
     return await pool().fetchrow("SELECT * FROM jobs WHERE id = $1", job_id)
 
 
+async def calls_to_number(
+    identity: str, number: str, limit: int = 10
+) -> list[asyncpg.Record]:
+    """What we have called this number about, most recent first.
+
+    The reverse of every other query here, and the one an incoming call needs:
+    a callback arrives carrying a number and nothing else.
+
+    Joined to `results` for the summary, because "we called them" is not useful
+    on its own — "we asked whether they stock X and they said no" is.
+
+    Scoped to the requesting identity, like every other read. A caller sees the
+    calls it placed, not the box's whole call history. NOTE for the inbound
+    secretary: it will want a wider scope than one identity, and widening it is
+    a deliberate decision about whose activity is visible to whom — not
+    something to reach for because the query was already here.
+    """
+    return await pool().fetch(
+        """
+        SELECT j.id, j.number, j.country, j.language, j.goal, j.call_status,
+               j.disposition, j.created_at, j.ended_at, j.caller_id,
+               r.summary, r.answers, r.goal_achieved
+        FROM jobs j LEFT JOIN results r ON r.job_id = j.id
+        WHERE j.identity = $1 AND j.number = $2
+        ORDER BY j.created_at DESC LIMIT $3
+        """,
+        identity, number, limit,
+    )
+
+
 async def get_job_by_idempotency(
     identity: str, key: str, conn: asyncpg.Connection | None = None
 ) -> asyncpg.Record | None:

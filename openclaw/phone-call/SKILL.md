@@ -1,6 +1,6 @@
 ---
 name: phone-call
-description: Make a real phone call to a real person to find something out or arrange something, and get structured answers back. Use when information exists only by phone — a hotel's parking price, whether a restaurant has a table, a clinic's opening hours, whether an order is ready, chasing a tradesman who does not answer email. Also use when the user explicitly asks to call somewhere. Handles ru/en/es. Do NOT use for anything the web can answer, for anything unsolicited or promotional, or to reach the user themselves.
+description: Make a real phone call to a real person to find something out or arrange something, and get structured answers back. Use when information exists only by phone — a hotel's parking price, whether a restaurant has a table, a clinic's opening hours, whether an order is ready, chasing a tradesman who does not answer email. Also use when the user explicitly asks to call somewhere. Handles ru/en/es/pl. Do NOT use for anything the web can answer, for anything unsolicited or promotional, or to reach the user themselves.
 ---
 
 # Phone call
@@ -55,7 +55,7 @@ All scripts read `ZVONOK_API_URL` and `ZVONOK_API_TOKEN` from the environment.
 ### 1. Place the call
 
 ```bash
-scripts/call.sh <+E164> <ru|en|es> "<goal>" ['<answer_schema JSON>']
+scripts/call.sh <+E164> <ru|en|es|pl> "<goal>" ['<answer_schema JSON>']
 ```
 
 Returns immediately with a `call_id`. **It does not wait for the conversation.**

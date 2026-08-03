@@ -1,0 +1,22 @@
+# Number list for tools/canvass.py — one E.164 per line, `#` starts a label.
+# The label is only used to make the run's report readable; it is never spoken
+# and never reaches the callee.
+#
+#     tools/canvass.py playbooks/pl-pharmacy-ozempic.json playbooks/numbers/mine.txt
+#
+# ⚠ Every number in THIS file is fake. Real lists are deliberately not in the
+# repo — `playbooks/numbers/` is gitignored apart from this example.
+#
+# That is not a secrecy rule; the numbers of a high street pharmacy are public.
+# It is that a list of real businesses, sitting next to a tool that dials them
+# and a playbook telling it what to ask, is a loaded gun with a target taped to
+# it — one `git clone` from being run by someone who never chose the callees.
+# Keep the aim separate from the trigger. Yours belongs on your disk.
+#
+# Before running any list, re-read BRIEF §6 and §8: one task = one call, no
+# bulk or marketing calling ever, and the disclosure is not optional.
+
++48221234501   # Apteka Przykładowa, Marszałkowska 1
++48221234502   # Apteka Druga, Puławska 2
++48221234503   # Apteka Trzecia, Wołoska 3 (całodobowa)
++48221234504   # Apteka Czwarta, Chełmska 4

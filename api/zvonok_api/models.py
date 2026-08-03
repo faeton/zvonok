@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field, field_validator
 class CallRequest(BaseModel):
     number: str = Field(..., description="Destination in E.164, e.g. +34911234567")
     goal: str = Field(..., min_length=8, max_length=2000)
-    language: Literal["ru", "en", "es"]
+    language: Literal["ru", "en", "es", "pl"]
 
     caller_id: str | None = None
     answer_schema: dict[str, Any] | None = None
@@ -25,12 +25,22 @@ class CallRequest(BaseModel):
     # Omitted → chosen from the destination country and the goal (BRIEF §8.1).
     # An explicit value always wins, so a caller who knows their jurisdiction
     # is never overridden by our heuristic.
-    disclosure_level: Literal["light", "full"] | None = None
+    #
+    # "brief" is never chosen automatically: it is the shortest disclosure we
+    # have, and shortening the disclosure must be a decision the requesting
+    # agent makes for a call it knows is a one-question canvass — not something
+    # a heuristic does on its own.
+    disclosure_level: Literal["brief", "light", "full"] | None = None
     # Who the agent says it is calling for: "your regular customer", "Ивана".
     # Omitted → a per-language default ("a potential client"). Free text chosen
     # by the requesting agent from the task's context; Russian must arrive
     # already in the genitive because it is spliced into the spoken disclosure.
     introduce_as: str | None = Field(None, min_length=2, max_length=120)
+    # Proper nouns to bias speech recognition towards: a drug, a brand, a part
+    # number. These are the words an 8 kHz line destroys first and the words the
+    # whole call usually turns on. Bounded — a long list degrades recognition
+    # instead of helping it.
+    keywords: list[str] | None = Field(None, max_length=16)
     callback_url: str | None = None
     idempotency_key: str | None = Field(None, max_length=200)
     # Bounded synchronous wait. This catches instant SIP failures (busy, invalid

@@ -108,6 +108,7 @@ def phone_call(
     wait_seconds: int = 10,
     disclosure_level: str | None = None,
     introduce_as: str | None = None,
+    keywords: list[str] | None = None,
     idempotency_key: str | None = None,
 ) -> str:
     """Place a real phone call to accomplish a task, and get the answer back.
@@ -129,7 +130,7 @@ def phone_call(
         goal: What to accomplish, written for the assistant rather than to be
             read aloud, e.g. "Find out whether guests can park onsite and what
             it costs per night."
-        language: "en", "ru" or "es". The call opens in this language.
+        language: "en", "ru", "es" or "pl". The call opens in this language.
         answer_schema: Optional JSON Schema for the facts you want back. Give
             each property a `description` — it tells the assistant what to ask
             about on the call, not just what to extract afterwards. Use nullable
@@ -141,9 +142,18 @@ def phone_call(
         max_duration_seconds: Hard cap on the call, default 300, maximum 600.
         wait_seconds: How long to wait for a dialling verdict before returning
             (0-30). This never waits for the conversation to finish.
-        disclosure_level: "light" or "full". Leave unset — it is chosen from the
-            destination country and the goal. "full" adds explicit
+        disclosure_level: "brief", "light" or "full". Leave unset for anything
+            that is a conversation — it is then chosen from the destination
+            country and the goal, and "full" adds explicit
             transcribed-and-stored wording plus an offer to end the call.
+            Set "brief" DELIBERATELY, and only for a one-question canvassing
+            call — ringing round pharmacies for a drug, shops for a part, clinics
+            for a slot. It drops the name and the who-we-are-calling-for clause,
+            opens with "this is an AI assistant, I'll note the answer down" and
+            goes straight to the question, and it tells the assistant to take the
+            first answer and hang up. Pair it with a short max_duration_seconds
+            (90-120): a canvass that turns into a conversation has already
+            failed. It is refused for goals that book or commit something.
         introduce_as: Who the assistant says it is calling for, e.g. "a potential
             client" (the default), "your regular customer", or the owner's first
             name when the callee personally knows them. Pick it from the task's
@@ -152,6 +162,13 @@ def phone_call(
             supply the genitive ("вашего постоянного клиента", "Ивана"). The
             owner's name/number are never spoken in the introduction either way —
             only later, if the booking needs them.
+        keywords: Proper nouns the call turns on — a drug, a brand, a part
+            number, a surname. These bias speech recognition towards words an
+            8 kHz phone line destroys first, and they are the single cheapest
+            thing you can do for accuracy on a call about a named thing. Give
+            the spellings a native speaker would use ("Ozempic", "semaglutyd").
+            Keep it short and specific; a long list makes recognition worse, not
+            better, so up to about a dozen.
         idempotency_key: Set this if you want to control de-duplication. By
             default identical requests within ten minutes collapse onto one call
             so a retry cannot dial the same person twice.
@@ -171,6 +188,8 @@ def phone_call(
         payload["disclosure_level"] = disclosure_level
     if introduce_as:
         payload["introduce_as"] = introduce_as
+    if keywords:
+        payload["keywords"] = keywords
 
     payload["idempotency_key"] = idempotency_key or _auto_idempotency_key(
         _fingerprint(payload)

@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
@@ -63,11 +64,21 @@ async def lifespan(app: FastAPI):
     settings.require()
     await db.connect()
     task = asyncio.create_task(janitor.run_forever(), name="janitor")
-    logger.info(
-        "call-api up: agent=%s livekit=%s extractor=%s identities=%s",
-        settings.agent_name, settings.livekit_url, settings.extractor_model,
-        sorted(set(settings.tokens.values())),
-    )
+    logger.info("call-api up: livekit=%s tenants=%d", settings.livekit_url, len(settings.tenants))
+    for name, tenant in sorted(settings.tenants.items()):
+        members = sorted(
+            lim.identity for lim in settings.limits.values() if lim.tenant == name
+        )
+        logger.info(
+            "  tenant %s: worker=%s extractor=%s caller_ids=%s identities=%s",
+            name, tenant.agent_name, tenant.extractor_model,
+            ",".join(sorted(tenant.caller_ids.owned)) or "(trunk default)",
+            ",".join(members),
+        )
+    # Misconfigurations that are legal but cost money or fairness. Loud at
+    # startup rather than discovered in an invoice.
+    for warning in settings.warnings:
+        logger.warning("config: %s", warning)
     try:
         yield
     finally:
@@ -104,13 +115,37 @@ async def client_identity(
 
 async def internal_only(
     authorization: Annotated[str | None, Header()] = None,
-) -> None:
-    """The agent worker's token. Can report call outcomes; cannot place calls."""
-    if not secrets.compare_digest(_bearer(authorization), settings.internal_token):
+) -> str:
+    """The agent worker's token. Can report call outcomes; cannot place calls.
+
+    Returns WHICH tenant's worker is calling. That is the whole point: the
+    internal endpoints take a job id from the URL and act on it, so a token that
+    only proves "some worker on this box" lets any tenant's worker settle any
+    other tenant's call. Room names embed the job id and the LiveKit credential
+    that can list rooms is shared, so targeting is not the hard part.
+    """
+    tenant = settings.tenant_for_internal_token(_bearer(authorization))
+    if tenant is None:
         raise HTTPException(401, "unknown internal token")
+    return tenant
 
 
 ClientId = Annotated[str, Depends(client_identity)]
+# The reporting worker's tenant, not merely "authenticated".
+InternalTenant = Annotated[str, Depends(internal_only)]
+
+
+def _job_for_worker(job: Mapping[str, Any] | None, job_id: str, tenant: str) -> Mapping[str, Any]:
+    """404 for a job that is not this worker's, exactly as for one that does not
+    exist.
+
+    Not 403: distinguishing the two tells a caller that a job id is real and
+    belongs to somebody else, which is the same disclosure `_job_or_404` refuses
+    across identities.
+    """
+    if job is None or settings.tenant_of(job).name != tenant:
+        raise HTTPException(404, f"no call {job_id}")
+    return job
 
 
 @app.exception_handler(policy.PolicyError)
@@ -139,9 +174,16 @@ async def _enforce_caps(
     Calls already in flight are counted at their CAP, not at zero. Billing lands
     only when a call ends, so a budget that ignores in-flight work lets a client
     admit its whole day's spend in the seconds before the first call finishes.
+
+    Spend is capped per IDENTITY (whose budget) but concurrency has two limits:
+    a per-identity share, and the box-wide ceiling that exists because de1's CPU
+    and upstream bandwidth do not care whose call it is. Nothing here tells one
+    tenant anything about another's traffic beyond a count.
     """
+    limits = settings.limits_for(identity)
+    tenant = settings.tenant_for(identity)
     projected = policy.estimate_usd(
-        destination.country, max_duration, destination.caller_id
+        destination.country, max_duration, destination.caller_id, tenant.caller_ids
     )
 
     row = await db.spend_today(identity, conn)
@@ -153,48 +195,67 @@ async def _enforce_caps(
     mine = [j for j in open_jobs if j["identity"] == identity]
     reserved_seconds = sum(j["max_duration_seconds"] for j in mine)
     reserved_usd = sum(
-        policy.estimate_usd(j["country"], j["max_duration_seconds"], j["caller_id"])
+        policy.estimate_usd(
+            j["country"], j["max_duration_seconds"], j["caller_id"], tenant.caller_ids
+        )
         for j in mine
     )
 
-    if calls >= settings.daily_calls_per_identity:
+    if calls >= limits.daily_calls:
         raise HTTPException(429, f"daily call cap reached for {identity} ({calls})")
 
     minutes = (seconds + reserved_seconds + max_duration) / 60.0
-    if minutes > settings.daily_minutes_per_identity:
+    if minutes > limits.daily_minutes:
         raise HTTPException(
             429,
             f"daily minute cap would be exceeded for {identity}: "
-            f"{minutes:.1f} min > {settings.daily_minutes_per_identity} "
+            f"{minutes:.1f} min > {limits.daily_minutes} "
             f"(includes {reserved_seconds / 60:.1f} min already in flight)",
         )
 
-    if usd + reserved_usd + projected > settings.daily_usd_per_identity:
+    if usd + reserved_usd + projected > limits.daily_usd:
         raise HTTPException(
             429,
             f"daily spend cap would be exceeded for {identity}: "
             f"${usd:.2f} spent + ${reserved_usd:.2f} in flight + "
-            f"${projected:.2f} projected > ${settings.daily_usd_per_identity:.2f}",
+            f"${projected:.2f} projected > ${limits.daily_usd:.2f}",
         )
 
+    if len(mine) >= limits.max_concurrent:
+        raise HTTPException(
+            429,
+            f"{len(mine)} call(s) already in flight for {identity} (cap "
+            f"{limits.max_concurrent}): {', '.join(j['id'] for j in mine)}",
+        )
+
+    # The box ceiling. Deliberately reports a COUNT and not the job ids: with
+    # more than one tenant on the host, those ids are somebody else's.
     if len(open_jobs) >= settings.max_concurrent_calls:
         raise HTTPException(
             429,
-            f"{len(open_jobs)} call(s) already in flight (cap "
-            f"{settings.max_concurrent_calls}): "
-            f"{', '.join(j['id'] for j in open_jobs)}",
+            f"{len(open_jobs)} call(s) already in flight on this host (cap "
+            f"{settings.max_concurrent_calls}) — try again shortly",
         )
 
     # Not dialling twice is the actual content of idempotency (BRIEF §9 trap 2),
     # and a same-number in-flight check catches the case a key cannot: two
     # different agents, two different keys, one increasingly annoyed restaurant.
+    #
+    # Scoped to the TENANT, because that is the scope in which the restaurant
+    # gets annoyed — two identities on one account are one caller as far as the
+    # callee is concerned. Across tenants it would be a false conflict (separate
+    # accounts, separate numbers, coincidental target) and would leak the other
+    # tenant's call target, so it deliberately does not fire.
     for job in open_jobs:
-        if job["number"] == destination.number:
-            raise HTTPException(
-                409,
-                f"a call to {destination.number} is already in flight as "
-                f"{job['id']} ({job['call_status']})",
-            )
+        if job["number"] != destination.number:
+            continue
+        if settings.tenant_of(job).name != tenant.name:
+            continue
+        raise HTTPException(
+            409,
+            f"a call to {destination.number} is already in flight as "
+            f"{job['id']} ({job['call_status']})",
+        )
 
     return projected
 
@@ -204,10 +265,16 @@ async def _enforce_caps(
 
 @app.post("/v1/calls", response_model=CallCreated, status_code=202)
 async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
-    destination = policy.check_destination(req.number, req.caller_id)
+    # Resolved before anything else: the tenant decides which numbers this client
+    # may present, which trunk the call leaves on, and who pays for it.
+    limits = settings.limits_for(identity)
+    tenant = settings.tenant_for(identity)
+    destination = policy.check_destination(
+        req.number, req.caller_id, tenant.caller_ids
+    )
     max_duration = min(
-        req.max_duration_seconds or settings.max_duration_default,
-        settings.max_duration_hard,
+        req.max_duration_seconds or limits.max_duration_default,
+        limits.max_duration_hard,
     )
     disclosure_level = policy.disclosure_level_for(
         destination.country, req.goal, req.disclosure_level
@@ -239,6 +306,8 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         await db.insert_job({
             "id": job_id,
             "identity": identity,
+            # Written here, at admission, so the answer cannot move later.
+            "tenant": tenant.name,
             "idempotency_key": req.idempotency_key,
             "number": destination.number,
             "country": destination.country,
@@ -260,6 +329,10 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         job_id=job_id,
         identity=identity,
         detail={
+            # Whose account this call is billed to. Also on the job row now, so
+            # this is corroboration rather than the only record — an append-only
+            # event and a mutable row disagreeing is itself worth seeing.
+            "tenant": tenant.name,
             "number": destination.number,
             "country": destination.country,
             "caller_id": destination.caller_id,
@@ -280,6 +353,7 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         "max_duration_seconds": max_duration,
         "disclosure_level": disclosure_level,
         "introduce_as": req.introduce_as,
+        "keywords": req.keywords,
         "profile": req.profile,
         # Fed to the agent as well as to the extractor: otherwise the agent never
         # thinks to ASK for a field the schema requires (BRIEF §9 trap 8).
@@ -296,7 +370,9 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
 
     try:
         await db.update_job(job_id, call_status="provisioning")
-        _, dispatch_id = await dispatch.dispatch_call(job_id, metadata)
+        _, dispatch_id = await dispatch.dispatch_call(
+            job_id, metadata, tenant.agent_name
+        )
     except Exception as e:  # noqa: BLE001
         logger.exception("dispatch failed for %s", job_id)
         await db.update_job(
@@ -478,6 +554,57 @@ async def list_calls(
     ]
 
 
+@app.get("/v1/contacts/{number}")
+async def contact_history(number: str, identity: ClientId) -> dict[str, Any]:
+    """What we have called this number about — the callback lookup.
+
+    Every outbound call was already recorded in full, and none of it was
+    reachable by the one key an incoming call hands you. This is that direction.
+
+    Two uses, and they are not equally safe:
+
+    - **Before dialling.** "Have we already rung this pharmacy this week, and
+      what did they say?" Cheap, and it is how an agent avoids disturbing a
+      stranger twice to learn something it was already told.
+    - **When someone rings back.** Useful for ROUTING and for the operator's own
+      records. ⚠ It must not become a script.
+
+    On that second use: **caller ID is a hint, not authentication.** It is
+    trivially spoofable, and even when it is genuine it identifies a LINE, not a
+    person — pharmacies, clinics and hotels share a handset between shifts. So
+    "we called you about Ozempic on Tuesday" can be both correctly matched and
+    completely wrong: the right number, a different human, and a disclosure of
+    the principal's business to someone who never asked. That failure looks
+    entirely legitimate from the inside, which is what makes it dangerous.
+
+    The rule for anything that speaks: use this to know who you are probably
+    talking to, never to tell them what we know. A caller may be told that we
+    may have called their number recently and offered a message; they may not be
+    read the goal, the schema, the answers, or any other number we dialled.
+    """
+    number = policy.normalise_number(number)
+    rows = await db.calls_to_number(identity, number)
+    return {
+        "number": number,
+        "calls": [
+            {
+                "call_id": r["id"],
+                "created_at": r["created_at"].isoformat(),
+                "ended_at": r["ended_at"].isoformat() if r["ended_at"] else None,
+                "goal": r["goal"],
+                "language": r["language"],
+                "caller_id": r["caller_id"],
+                "call_status": r["call_status"],
+                "disposition": r["disposition"],
+                "summary": r["summary"],
+                "answers": r["answers"],
+                "goal_achieved": r["goal_achieved"],
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.post("/v1/calls/{call_id}/cancel")
 async def cancel_call(call_id: str, identity: ClientId) -> dict[str, Any]:
     job = await _job_or_404(call_id, identity)
@@ -534,23 +661,24 @@ async def reextract(call_id: str, identity: ClientId) -> CallResult:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    open_jobs = await db.open_jobs()
-    return {
-        "ok": True,
-        "in_flight": [j["id"] for j in open_jobs],
-        "concurrency_cap": settings.max_concurrent_calls,
-    }
+    """Liveness only, because this endpoint has no authentication.
+
+    It used to list every in-flight job id. On a single-tenant box that was a
+    convenience; with a second tenant on the host it is another account's call
+    volume. Even a bare count is activity: polled on a timer it says when the
+    other tenant is on the phone and for how long. The cap is static config, so
+    it stays. Use `GET /v1/calls` with a bearer token to see your own traffic.
+    """
+    return {"ok": True, "concurrency_cap": settings.max_concurrent_calls}
 
 
 # --- internal: the agent reporting in ---------------------------------------
 
 
-@app.post("/v1/internal/calls/{job_id}/events", dependencies=[Depends(internal_only)])
-async def agent_event(job_id: str, event: AgentEvent) -> dict[str, str]:
+@app.post("/v1/internal/calls/{job_id}/events")
+async def agent_event(job_id: str, event: AgentEvent, tenant: InternalTenant) -> dict[str, str]:
     """Advisory progress. Never moves a job backwards (see db.advance_call_status)."""
-    job = await db.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, f"no call {job_id}")
+    job = _job_for_worker(await db.get_job(job_id), job_id, tenant)
 
     mapping = {
         "dispatched": "provisioning",
@@ -566,12 +694,15 @@ async def agent_event(job_id: str, event: AgentEvent) -> dict[str, str]:
     return {"ok": "true"}
 
 
-@app.post("/v1/internal/calls/{job_id}/final", dependencies=[Depends(internal_only)])
-async def agent_final(job_id: str, final: AgentFinal) -> dict[str, str]:
+@app.post("/v1/internal/calls/{job_id}/final")
+async def agent_final(job_id: str, final: AgentFinal, tenant: InternalTenant) -> dict[str, str]:
     """The end-of-call report. Idempotent by design: delivery is at-least-once,
     so a redelivery after a timed-out POST is expected traffic (BRIEF §9 trap 4)."""
-    job = await db.get_job(job_id)
-    if job is None:
-        raise HTTPException(404, f"no call {job_id}")
+    # A body that reports on a different call than the URL names is not a
+    # redelivery, it is a mistake or an attempt — and record_final refreshes
+    # turns before it checks whether the outcome is settled, so it would land.
+    if final.job_id and final.job_id != job_id:
+        raise HTTPException(400, "final.job_id does not match the URL")
+    job = _job_for_worker(await db.get_job(job_id), job_id, tenant)
     await pipeline.record_final(job, final)
     return {"ok": "true", "call_id": job_id}

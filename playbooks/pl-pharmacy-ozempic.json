@@ -1,0 +1,36 @@
+{
+  "name": "pl-pharmacy-ozempic",
+  "description": "Ring round Polish pharmacies for Ozempic 2 mg. One question, thirty seconds, next number.",
+  "language": "pl",
+  "disclosure_level": "brief",
+  "max_duration_seconds": 120,
+  "wait_seconds": 20,
+  "keywords": ["Ozempic", "semaglutyd", "2 mg", "1 mg", "recepta"],
+  "goal": "Find out whether this pharmacy has Ozempic 2 mg (semaglutide, 2 mg pen) in stock right now.\n\nOpen with that and nothing else: whether they have Ozempic 2 mg. No name, no explanation of who is calling, no preamble.\n\nIf they say yes, that is the whole call — confirm you heard 2 mg and not another strength, note it and thank them.\n\nIf they say no, ask ONE thing: is it simply out at the moment, or is 2 mg unavailable in general — nobody has it, they cannot order it. One sentence.\n\nOnly if they say 2 mg is unavailable in general, ask one last question: the client holds a Polish prescription written for 2 mg, so would they dispense 1 mg against that 2 mg prescription? Ask it once, take whatever answer comes, and do not press, do not argue, and do not ask them to check with a pharmacist or a doctor. A plain \"no\" or \"that depends on the doctor\" is a complete answer.\n\nDo not give the client's name, do not leave a phone number, do not ask them to hold or reserve anything, and do not ask them to call back.",
+  "answer_schema": {
+    "type": "object",
+    "properties": {
+      "ozempic_2mg_in_stock": {
+        "type": ["boolean", "null"],
+        "description": "Do they have Ozempic 2 mg on the shelf right now? This is the whole point of the call — ask it first."
+      },
+      "availability": {
+        "type": ["string", "null"],
+        "enum": ["in_stock", "out_right_now", "unavailable_generally", "unknown", null],
+        "description": "Whether 2 mg is in stock, merely out at the moment, or not to be had at all (nobody has it, cannot be ordered). Only ask if the answer to the first question was no."
+      },
+      "ozempic_1mg_in_stock": {
+        "type": ["boolean", "null"],
+        "description": "Whether they have the 1 mg pen instead. Only relevant once 2 mg turns out to be unavailable."
+      },
+      "would_dispense_1mg_on_2mg_prescription": {
+        "type": ["boolean", "null"],
+        "description": "Whether they would dispense 1 mg against a Polish prescription written for 2 mg. Ask once, take the answer as given, never push."
+      },
+      "notes": {
+        "type": ["string", "null"],
+        "description": "Anything else worth knowing in one line — when they expect a delivery, that they can order it, that another branch has it."
+      }
+    }
+  }
+}

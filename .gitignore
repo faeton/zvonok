@@ -17,3 +17,9 @@ __pycache__/
 
 # Private registration state (account numbers, DIDs, balances) — local only.
 ACCOUNTS.md
+
+# Real canvass target lists stay local. The numbers themselves are public, but
+# a ready-to-run target list bundled with the dialler is not something to hand
+# out (see playbooks/numbers/example.txt).
+playbooks/numbers/*
+!playbooks/numbers/example.txt

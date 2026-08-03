@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from . import db, extractor, policy, states
+from .config import settings
 from .models import AgentFinal
 
 logger = logging.getLogger("zvonok.pipeline")
@@ -54,7 +55,10 @@ async def record_final(job: Any, final: AgentFinal) -> None:
     # Priced on the caller ID actually used: origin is a ×20–34 cost lever on
     # EU/UK routes (BRIEF §9 phase-0), so pricing by destination alone would
     # under-report by an order of magnitude exactly when a client overrode it.
-    est = policy.estimate_usd(job["country"], billable, job["caller_id"])
+    est = policy.estimate_usd(
+        job["country"], billable, job["caller_id"],
+        settings.tenant_of(job).caller_ids,
+    )
 
     # A callee who objected to being transcribed was told out loud that nothing
     # would be kept. The agent already discarded the turns; make sure nothing
@@ -157,6 +161,7 @@ async def run_extraction(job: Any) -> None:
             turns=turns,
             captured=captured,
             answer_schema=job["answer_schema"],
+            tenant=settings.tenant_of(job),
         )
     except Exception as e:  # noqa: BLE001 — every failure mode ends the same way
         logger.exception("extraction failed for %s", job_id)

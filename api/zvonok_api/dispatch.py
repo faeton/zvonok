@@ -37,23 +37,35 @@ def room_name_for(job_id: str) -> str:
     return f"zvonok-{job_id}"
 
 
-async def dispatch_call(job_id: str, metadata: dict[str, Any]) -> tuple[str, str]:
+async def dispatch_call(
+    job_id: str, metadata: dict[str, Any], agent_name: str
+) -> tuple[str, str]:
     """Create the agent job. Returns (room_name, dispatch_id).
 
     The metadata carries call parameters only — never a credential. The agent
     reaches call-api using its own env-provided internal token, because dispatch
     metadata is persisted in LiveKit/Redis and shows up in logs.
+
+    `agent_name` is how a multi-tenant deployment stays honest about that rule.
+    Each tenant runs its own worker under its own name, holding its own Zadarma
+    trunk and voice-brain key in its own process env; choosing the name here is
+    the only tenant-specific thing that crosses this boundary, and it is not a
+    secret. Route a job to the wrong name and the call goes out on the wrong
+    account's trunk with the wrong number — which is why config warns when two
+    tenants share one.
     """
     room = room_name_for(job_id)
     async with _lk() as lk:
         resp = await lk.agent_dispatch.create_dispatch(
             api.CreateAgentDispatchRequest(
-                agent_name=settings.agent_name,
+                agent_name=agent_name,
                 room=room,
                 metadata=json.dumps(metadata, ensure_ascii=False),
             )
         )
-    logger.info("dispatched job %s → room %s (%s)", job_id, room, resp.id)
+    logger.info(
+        "dispatched job %s → room %s via %s (%s)", job_id, room, agent_name, resp.id
+    )
     return room, resp.id
 
 

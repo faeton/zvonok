@@ -48,11 +48,37 @@ CREATE TABLE IF NOT EXISTS jobs (
 -- Idempotency is scoped per identity: two different agents using the same
 -- boring key ("call-hotel") must not collide, but one agent retrying its own
 -- request must not dial twice (BRIEF §9 phase-2 trap 2).
+-- Which billing account this call was ADMITTED under. Stored, not derived from
+-- `identity` at read time, and the difference is money: the tenant decides
+-- whose xAI key reads the transcript and whose numbers the call went out on.
+-- Re-deriving it later means editing ZVONOK_TENANT_<IDENTITY> — or removing the
+-- mapping while jobs are unextracted — silently moves extraction, /reextract
+-- and the janitor's disk recovery onto the new mapping, handing one tenant's
+-- transcript to another tenant's key. Dispatch already fixes the trunk at
+-- placement; this makes the accounting equally immutable.
+--
+-- Nullable, because rows written before the column existed cannot be backfilled
+-- from SQL: the identity→tenant mapping lives in env, not in the database.
+-- Settings.tenant_of() falls back to the derived answer for those.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tenant TEXT;
+
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_idem_key
     ON jobs (identity, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs (created_at DESC);
+
+-- "Who is this, and what did we call them about?" — the question a callback
+-- asks, and the one shape this table could not answer. Every call was recorded
+-- in full and none of it was reachable by the only key an incoming call gives
+-- you: the number. Not a new store, just the missing direction on the old one.
+--
+-- `identity` leads because the query filters on both and reads are always
+-- identity-scoped. Keyed on number alone, a shared business number that several
+-- identities had called would make Postgres walk everyone else's rows to find
+-- the ten belonging to the caller.
+CREATE INDEX IF NOT EXISTS jobs_identity_number
+    ON jobs (identity, number, created_at DESC);
 CREATE INDEX IF NOT EXISTS jobs_open ON jobs (call_status)
     WHERE call_status NOT IN (
         'completed', 'busy', 'no_answer', 'rejected', 'voicemail',

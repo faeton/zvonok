@@ -25,12 +25,13 @@ spending here does not eat the Mac's budget, and every job records who asked.
 |---|---|---|
 | `number` | yes | E.164, e.g. `+34911234567` |
 | `goal` | yes | Written for the assistant, not read aloud |
-| `language` | yes | `ru`, `en` or `es` |
+| `language` | yes | `ru`, `en`, `es` or `pl` |
 | `answer_schema` | no | JSON Schema; **descriptions drive what gets asked** |
 | `max_duration_seconds` | no | Default 300, range 30–600 |
 | `caller_id` | no | Leave unset — see below |
-| `disclosure_level` | no | `light` / `full`; leave unset |
+| `disclosure_level` | no | `brief` / `light` / `full`; leave unset except for a one-question canvass, which wants `brief` |
 | `introduce_as` | no | Who the call is said to be for; default "a potential client" |
+| `keywords` | no | Proper nouns the call turns on — a drug, a brand, a part number. Biases speech recognition; ≤16 |
 | `callback_url` | no | HMAC-signed webhook on completion |
 | `idempotency_key` | no | Reusing one always returns the original job |
 | `wait_seconds` | no | 0–30. Catches instant failures only |
@@ -47,7 +48,17 @@ it with a mismatched origin is the easiest way to make a cheap call expensive.
 It is chosen from the destination country and whether the goal commits to
 something on the owner's behalf. Germany, Switzerland and Poland always get the
 explicit transcribed-and-stored wording; so does any goal that books, orders,
-reserves or cancels. Overriding it down is a legal decision, not a tuning knob.
+reserves or cancels. Overriding it down is a legal decision, not a tuning knob —
+and `brief` on a goal that commits to something is refused outright, upgraded to
+`full` rather than honoured.
+
+### `keywords` — say the words the line will destroy
+
+An 8 kHz phone line mangles proper nouns first, and a canvass usually turns on
+exactly one of them. Passing `["Ozempic", "semaglutyd"]` biases the recogniser
+towards hearing them; without it the call can turn on a word the transcript never
+contains. Give native spellings, keep the list short — a long one makes
+recognition worse rather than better.
 
 ### `introduce_as` — the framing of who is calling
 

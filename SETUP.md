@@ -31,7 +31,7 @@ Collect everything up front; each maps to a `deploy/.env` value.
 | Which countries they actually want to call | keep the allowlist tight | `api/zvonok_api/policy.py` `_PREFIXES` |
 | Daily budget (calls / minutes / USD) | spend caps are enforced before dialling | `ZVONOK_DAILY_*` |
 
-Ask before assuming: **which languages** (ru/en/es supported), and whether any
+Ask before assuming: **which languages** (ru/en/es/pl supported), and whether any
 destination country has two-party-consent rules they care about (then the
 `full` disclosure wording applies — see BRIEF §8).
 
@@ -52,8 +52,14 @@ On the server:
 
 ```bash
 git clone https://github.com/faeton/zvonok && cd zvonok/deploy
-cp .env.example .env && chmod 600 .env
-# fill in EVERY section of .env — each variable is documented inline
+
+# Secrets live OUTSIDE the checkout, with deploy/.env as a symlink to them.
+# The checkout gets rsync'd and pulled over; the secrets must survive that.
+mkdir -p ~/.config/zvonok && chmod 700 ~/.config/zvonok
+cp .env.example ~/.config/zvonok/env && chmod 600 ~/.config/zvonok/env
+ln -s ~/.config/zvonok/env .env
+# fill in EVERY section of ~/.config/zvonok/env — each variable is documented inline
+
 ./deploy.sh                  # renders configs, builds, starts the stack
 sudo ./firewall.sh           # scopes 5060+RTP to the SIP provider's ranges
 ./lkctl.sh create-trunk      # prints SIP_OUTBOUND_TRUNK_ID → put it in .env
@@ -63,6 +69,13 @@ docker compose up -d agent   # picks up the trunk id
 Generate secrets as documented in `.env.example` (`openssl rand …`). Never
 reuse a token between two client identities — per-identity tokens are what
 make per-agent caps and audit work.
+
+⚠ **Do not `rsync --delete` into the checkout.** Everything that only exists on
+the server is gitignored, which is precisely what `--delete` removes: it wiped
+`deploy/.env` once — every key, token and DID — and nothing warned, because the
+running containers held their environment and the stack stayed up. The symlink
+above means the worst case is now a broken link that `deploy.sh` repairs on its
+next run. Sync with `--exclude '.env'`, or without `--delete`.
 
 Verify: `docker compose ps` all healthy; `docker compose logs --tail 5 sip`
 shows port 5060 listening; `./lkctl.sh trunks` shows your trunk.
@@ -111,7 +124,37 @@ All optional, all env, all in `deploy/.env.example` with examples:
   "your regular customer", or the owner's first name for callees who know
   them. The AI + note-taking disclosure itself is not configurable.
 
-## 7. Ongoing
+## 7. A second person on the same box
+
+Only if they have their **own Zadarma account and their own xAI key**. Sharing
+your trunk is not a lighter version of this — their calls would present your
+number, bill your balance, and route every callback to you.
+
+Each billing account is a **tenant**: its own worker container, its own trunk,
+its own DIDs, its own extraction key. Each bearer token is an **identity**, with
+its own caps and audit trail; several identities can belong to one tenant (your
+mac-claude and openclaw both belong to yours).
+
+1. They create a Zadarma trunk with **SIP credential auth**, not IP auth — yours
+   is authorised by de1's IP, and two accounts claiming one source IP makes
+   billing ambiguous. `./lkctl.sh create-trunk` with their credentials.
+2. Fill in the second-tenant block at the bottom of `.env` (every variable is
+   documented inline), including `COMPOSE_PROFILES="tenant2"`.
+3. Set a concurrency share for **both** of you — otherwise either can fill the
+   box alone. call-api warns at startup if you forget.
+4. `./deploy.sh`, then check the startup log: it prints one line per tenant with
+   the worker name, caller IDs and identities it resolved. If a tenant is
+   missing its own key or worker name, call-api refuses to start rather than
+   quietly falling back to yours.
+
+What is still shared and cannot be split without a second LiveKit and a second
+Postgres: the LiveKit API key (room admin), the internal token, the jobs
+database, and the transcript directory. Neither of you can read the other's
+calls through the API, but their callees' voice data lives on your disk under
+your retention policy. Fine between people who know each other; not a
+substitute for per-tenant infrastructure.
+
+## 8. Ongoing
 
 - Caps reset daily; check spend against the provider's statistics API rather
   than trusting the estimator forever (BRIEF §7).

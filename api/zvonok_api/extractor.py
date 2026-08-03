@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 import jsonschema
 
-from .config import settings
+from .config import Tenant
 
 logger = logging.getLogger("zvonok.extractor")
 
@@ -155,7 +155,10 @@ async def extract(
     turns: list[dict[str, Any]],
     captured: list[dict[str, Any]],
     answer_schema: dict[str, Any] | None,
+    tenant: Tenant,
 ) -> dict[str, Any]:
+    """`tenant` supplies the key and model: a tenant's transcript is read by the
+    model that tenant pays for, never by another tenant's account."""
     envelope = build_envelope(answer_schema)
     transcript = render_transcript(turns)
 
@@ -194,7 +197,7 @@ async def extract(
     ).hexdigest()[:16]
 
     payload = {
-        "model": settings.extractor_model,
+        "model": tenant.extractor_model,
         "temperature": 0,
         "messages": [
             {"role": "system", "content": _SYSTEM},
@@ -207,7 +210,7 @@ async def extract(
     }
 
     async with httpx.AsyncClient(timeout=90) as client:
-        data = await _post(client, payload)
+        data = await _post(client, payload, tenant)
 
         # A user-supplied schema can use constructs the strict validator rejects
         # (patternProperties, oneOf at the root, …). Rather than refusing the
@@ -216,7 +219,7 @@ async def extract(
         # answer at all.
         if data is None:
             payload["response_format"]["json_schema"]["strict"] = False
-            data = await _post(client, payload)
+            data = await _post(client, payload, tenant)
         if data is None:
             raise ExtractionError("extractor rejected the schema in both strict and loose mode")
 
@@ -236,18 +239,20 @@ async def extract(
         parsed.get("unreliable_fields") or [], parsed.get("answers") or {}, captured
     )
     parsed["prompt_hash"] = prompt_hash
-    parsed["model"] = settings.extractor_model
+    parsed["model"] = tenant.extractor_model
     return parsed
 
 
-async def _post(client: httpx.AsyncClient, payload: dict[str, Any]) -> str | None:
+async def _post(
+    client: httpx.AsyncClient, payload: dict[str, Any], tenant: Tenant
+) -> str | None:
     """Returns the message content, or None if the schema itself was rejected."""
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
             resp = await client.post(
-                f"{settings.xai_base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {settings.xai_api_key}"},
+                f"{tenant.xai_base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {tenant.xai_api_key}"},
                 json=payload,
             )
         except httpx.HTTPError as e:

@@ -124,43 +124,79 @@ def country_for(number: str) -> str | None:
 #                                cheap origin for most destinations
 #   ZVONOK_CALLER_ID_BY_COUNTRY  "UA:+380...,CY:+357..." per-country overrides
 #
+# These are PER TENANT (config.Tenant reads them with a `_<TENANT>` suffix),
+# because a DID is verified against one specific SIP account: tenant A cannot
+# present tenant B's number, and must not be able to try. The module-level
+# `DEFAULT_CALLER_IDS` below is the unsuffixed set — the single-tenant
+# configuration, unchanged.
+#
 # Caller ID is a COST lever before it is an answer-rate one: measured ×20–34
 # price swings on EU/UK destinations depending on the origin group (BRIEF §9
 # phase-0).
 
 
-def _csv(name: str) -> list[str]:
-    return [x.strip() for x in os.getenv(name, "").split(",") if x.strip()]
+def _split_csv(raw: str) -> list[str]:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
 
 
-def _country_map(name: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in _csv(name):
-        country, _, did = pair.partition(":")
-        if country and did:
-            out[country.strip().upper()] = did.strip()
-    return out
+@dataclass(frozen=True)
+class CallerIds:
+    """One tenant's verified numbers and how to pick between them.
+
+    Passed explicitly rather than read from module state so that two tenants can
+    coexist in one process. Every function that prices or validates a caller ID
+    takes one of these; the parameter is optional only so the single-tenant call
+    sites and the tests keep working against the unsuffixed env.
+    """
+
+    owned: frozenset[str]
+    default: str
+    by_country: dict[str, str]
+
+    @classmethod
+    def parse(cls, owned: str, default: str, by_country: str) -> CallerIds:
+        mapping: dict[str, str] = {}
+        for pair in _split_csv(by_country):
+            country, _, did = pair.partition(":")
+            if country and did:
+                mapping[country.strip().upper()] = did.strip()
+        return cls(
+            owned=frozenset(_split_csv(owned)),
+            default=(default or "").strip(),
+            by_country=mapping,
+        )
 
 
 # A caller ID we do not own is typically not rejected by the SIP provider — it
 # silently falls back to the account default, which is confusing to debug and
 # bills at the wrong origin rate. So validate ours here instead of discovering
 # it in an invoice.
-OWNED_CALLER_IDS = frozenset(_csv("ZVONOK_OWNED_CALLER_IDS"))
-DEFAULT_CALLER_ID = os.getenv("ZVONOK_DEFAULT_CALLER_ID", "")
-_CALLER_ID_BY_COUNTRY = _country_map("ZVONOK_CALLER_ID_BY_COUNTRY")
+DEFAULT_CALLER_IDS = CallerIds.parse(
+    owned=os.getenv("ZVONOK_OWNED_CALLER_IDS", ""),
+    default=os.getenv("ZVONOK_DEFAULT_CALLER_ID", ""),
+    by_country=os.getenv("ZVONOK_CALLER_ID_BY_COUNTRY", ""),
+)
 
 
-def caller_id_for(country: str | None, override: str | None = None) -> str:
+def caller_id_for(
+    country: str | None,
+    override: str | None = None,
+    ids: CallerIds | None = None,
+) -> str:
+    ids = ids or DEFAULT_CALLER_IDS
     if override:
-        if override not in OWNED_CALLER_IDS:
+        # Scoped to THIS tenant's verified list, which is what stops one tenant
+        # dialling out as another (they share a box, not an account). The error
+        # names only the caller's own numbers — the other tenant's DIDs are not
+        # this client's business.
+        if override not in ids.owned:
             raise PolicyError(
                 f"caller_id {override} is not on the verified list "
                 f"(ZVONOK_OWNED_CALLER_IDS); owned: "
-                f"{', '.join(sorted(OWNED_CALLER_IDS)) or 'none configured'}"
+                f"{', '.join(sorted(ids.owned)) or 'none configured'}"
             )
         return override
-    return _CALLER_ID_BY_COUNTRY.get(country or "", DEFAULT_CALLER_ID)
+    return ids.by_country.get(country or "", ids.default)
 
 
 # ---------------------------------------------------------------------------
@@ -192,23 +228,31 @@ EUR_USD = 1.08  # the whole figure is an estimate; a fixed rate is honest enough
 MODEL_USD_PER_MIN = 0.05
 
 
-def origin_group(caller_id: str | None) -> str:
+def origin_group(caller_id: str | None, ids: CallerIds | None = None) -> str:
     """Which pricing group our caller ID falls into.
 
     Derived from the caller ID's own country prefix: Ukrainian DIDs price as
     the expensive "ua" origin, the rest as "eu" — but only for numbers on the
     verified list. Anything unknown (including no caller ID at all, i.e. the
     trunk default) is priced pessimistically, so a gap in configuration cannot
-    quietly under-report against the spend cap.
+    quietly under-report against the spend cap. That is also why passing the
+    WRONG tenant's list here is safe: an unrecognised DID prices high, never low.
     """
-    if not caller_id or caller_id not in OWNED_CALLER_IDS:
+    ids = ids or DEFAULT_CALLER_IDS
+    if not caller_id or caller_id not in ids.owned:
         return "ua"
     return "ua" if caller_id.startswith("+380") else "eu"
 
 
-def estimate_usd(country: str | None, seconds: float, caller_id: str | None = None) -> float:
+def estimate_usd(
+    country: str | None,
+    seconds: float,
+    caller_id: str | None = None,
+    ids: CallerIds | None = None,
+) -> float:
+    ids = ids or DEFAULT_CALLER_IDS
     minutes = max(seconds, 0.0) / 60.0
-    group = origin_group(caller_id or DEFAULT_CALLER_ID)
+    group = origin_group(caller_id or ids.default, ids)
     rate = _EUR_PER_MIN.get(
         (country or "", group), _EUR_PER_MIN_UNMEASURED[group]
     )
@@ -230,23 +274,62 @@ _FULL_DISCLOSURE_COUNTRIES = frozenset({"DE", "CH", "PL"})
 # lists — because the goal is OUR text, written by the requesting agent, and the
 # failure mode is asymmetric: a false positive only makes the disclosure more
 # explicit than it needed to be.
+#
+# ⚠ This list is a BACKSTOP and is necessarily incomplete: it cannot cover every
+# way to express a commitment in four languages, let alone a goal phrased
+# obliquely ("tell them I'll take it"). What actually keeps `brief` honest is
+# that it is never selected automatically — a requester has to ask for it, for a
+# call they know is a one-question canvass. Treat a miss here as a gap in a
+# safety net, not as a hole in the only defence.
 _COMMITMENT_WORDS = (
+    # en
     "book", "booking", "reserve", "reservation", "cancel", "order", "buy",
     "schedule", "appointment", "confirm my", "on my behalf", "sign up",
-    "забронир", "заказ", "отмен", "запиш", "записать",
-    "reserva", "reservar", "cancelar", "pedido", "cita",
+    "sign me up", "put me down", "table for",
+    # ru
+    "забронир", "бронир", "заказ", "отмен", "запиш", "записать", "запись",
+    # es
+    "reserva", "reservar", "cancelar", "pedido", "pedir", "cita", "comprar",
+    # pl — added after review found the list had no Polish at all, while the
+    # only canvass we have ever run was Polish. "zarezerwuj stolik" and "zamów
+    # dwie pizze" both sailed through the gate.
+    "rezerw", "zarezerw", "zamów", "zamow", "zamaw", "anuluj", "odwoła",
+    "odwola", "umów", "umow", "wizyt", "zakup", "kupić", "kupic",
 )
 
 
 def disclosure_level_for(
     country: str | None, goal: str, override: str | None = None
 ) -> str:
-    if override in ("light", "full"):
+    """Pick the disclosure register. An explicit request wins — except upward.
+
+    "brief" is only ever reachable by explicit request (see CallRequest), and it
+    is the one level that is genuinely LESS than §8's baseline: it drops the
+    principal entirely, leaving only "I am an AI" and "your answer is kept".
+
+    That makes an unguarded override a real hole rather than a theoretical one:
+    a playbook file could set `"disclosure_level": "brief"` and quietly canvass
+    its way through a booking in a two-party-consent country. So a commitment —
+    booking, ordering, cancelling on someone's behalf — REFUSES brief and takes
+    the full text instead. Nobody commits anything in someone's name behind the
+    shortest disclosure we have.
+
+    Note the asymmetry, which is deliberate: a caller may always ask for MORE
+    disclosure than we would choose, never less than the goal warrants. The
+    country table is not applied to a `brief` request for a non-committal call:
+    the requester knows it is a fifteen-second stock check, and we only know
+    where the call is going.
+    """
+    low = (goal or "").lower()
+    commits = any(w in low for w in _COMMITMENT_WORDS)
+
+    if override == "brief" and commits:
+        return "full"
+    if override in ("brief", "light", "full"):
         return override
     if country in _FULL_DISCLOSURE_COUNTRIES:
         return "full"
-    low = (goal or "").lower()
-    if any(w in low for w in _COMMITMENT_WORDS):
+    if commits:
         return "full"
     return "light"
 
@@ -263,7 +346,11 @@ class Destination:
     caller_id: str
 
 
-def check_destination(raw_number: str, caller_id_override: str | None = None) -> Destination:
+def check_destination(
+    raw_number: str,
+    caller_id_override: str | None = None,
+    ids: CallerIds | None = None,
+) -> Destination:
     """Validate and price a destination, or raise PolicyError.
 
     Order matters: cheapest and most certain refusals first, so the error a
@@ -301,5 +388,5 @@ def check_destination(raw_number: str, caller_id_override: str | None = None) ->
     return Destination(
         number=number,
         country=country,
-        caller_id=caller_id_for(country, caller_id_override),
+        caller_id=caller_id_for(country, caller_id_override, ids),
     )

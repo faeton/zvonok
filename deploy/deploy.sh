@@ -4,7 +4,32 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-[[ -f .env ]] || { echo "no .env — copy .env.example and fill it in" >&2; exit 1; }
+# The real secrets live OUTSIDE the deploy tree, and `deploy/.env` is a symlink
+# to them. This is not tidiness — it is damage control for a specific accident
+# that has already happened once.
+#
+# `deploy/.env` is gitignored, so it exists only on de1. A `rsync -a --delete`
+# from the laptop therefore sees a file the source does not have and removes it:
+# every key, token and DID gone in one command, with no warning, from a command
+# whose purpose was to copy code. The stack keeps running (the containers hold
+# their env), so nothing looks broken until the next deploy.
+#
+# With the file kept at CANONICAL below, an rsync --delete can destroy at most
+# the symlink, and this script rebuilds it on the next run.
+CANONICAL="${ZVONOK_ENV_FILE:-$HOME/.config/zvonok/env}"
+
+if [[ ! -e .env && -f "$CANONICAL" ]]; then
+  ln -s "$CANONICAL" .env
+  echo "==> deploy/.env was missing — relinked to $CANONICAL"
+fi
+
+if [[ ! -e .env ]]; then
+  echo "no .env, and nothing at $CANONICAL either." >&2
+  echo "Fill in a copy of .env.example there, then:" >&2
+  echo "  mkdir -p \"\$(dirname \"$CANONICAL\")\" && chmod 700 \"\$(dirname \"$CANONICAL\")\"" >&2
+  echo "  ln -s \"$CANONICAL\" deploy/.env" >&2
+  exit 1
+fi
 set -a; . ./.env; set +a
 
 : "${LIVEKIT_API_KEY:?set in .env}"
