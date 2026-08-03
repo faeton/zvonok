@@ -62,9 +62,11 @@ chmod 600 livekit.rendered.yaml
 # Per tenant, because each worker mounts only its own: the janitor's disk
 # recovery settles a call and bills extraction without any token, so a shared
 # directory let any worker drop a file named for another tenant's job id.
-mkdir -p transcripts
 for tenant_dir in transcripts transcripts/default ${ZVONOK_TRANSCRIPT_TENANTS:-}; do
-  mkdir -p "$tenant_dir"
+  # sudo for mkdir too, not just chown: once the root is owned by uid 10001 the
+  # deploying user cannot create anything inside it, and the first run after
+  # per-tenant directories were introduced fails exactly there.
+  [[ -d "$tenant_dir" ]] || sudo mkdir -p "$tenant_dir"
   if [[ "$(stat -c %u "$tenant_dir")" != "10001" ]]; then
     sudo chown 10001:10001 "$tenant_dir"
     echo "==> chowned $tenant_dir/ to uid 10001 (agent container user)"
