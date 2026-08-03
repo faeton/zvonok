@@ -46,9 +46,13 @@ curl -fsS "$API_URL/healthz" >/dev/null || {
 
 # --- the skill files -------------------------------------------------------
 echo "==> installing skill files"
-install -d -o debian -g debian "$SKILLS/phone-call"
 rm -rf "$SKILLS/phone-call"
+# --exclude, because a stray __pycache__ from running the scripts locally would
+# otherwise be shipped to the gateway — harmless but confusing, and it makes the
+# installed tree stop matching the repo, which is how you lose track of whether
+# de1 is current.
 cp -r "$HERE/phone-call" "$SKILLS/phone-call"
+find "$SKILLS/phone-call" -name '__pycache__' -type d -prune -exec rm -rf {} +
 chown -R debian:debian "$SKILLS/phone-call"
 chmod +x "$SKILLS/phone-call/scripts/"*.sh
 

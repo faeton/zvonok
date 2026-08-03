@@ -36,7 +36,9 @@ machine. That is the cost, and it is larger than the money. One task, one call.
   human decision.
 - **Never call the same place twice** because the first answer was unsatisfying.
   If a fact is missing, decide whether it is worth a second interruption; usually
-  it is not.
+  it is not. `scripts/contacts.sh <number>` tells you what we already asked them
+  and what they said — check it before dialling somewhere that sounds familiar.
+  It costs nothing and rings nobody.
 - **Never call in bulk**, never anything promotional, never a list of numbers.
   This is a personal assistant tool, not an outbound dialler.
 - **Mind the hour at the destination**, not here. Do not ring a restaurant at
@@ -48,7 +50,7 @@ The call discloses that it is an AI and that the answer is being noted down.
 That is not optional and you cannot turn it off. `introduce_as` changes the
 framing of who it calls for, never those facts.
 
-## The three commands
+## The commands
 
 All scripts read `ZVONOK_API_URL` and `ZVONOK_API_TOKEN` from the environment.
 
@@ -72,6 +74,22 @@ scripts/result.sh <call_id> --transcript # plus turn-by-turn
 ```bash
 scripts/reextract.sh <call_id>
 ```
+
+### 4. Check whether we have called this number before
+
+```bash
+scripts/contacts.sh <+E164>
+```
+
+Dials nobody. Returns the calls we have already made to that number with their
+summaries, so "have we already asked them this?" is answerable before you spend
+someone's afternoon on it.
+
+⚠ If you are ever handling an **incoming** call, this is for knowing who you are
+probably talking to — never for telling them what we know. Caller ID identifies
+a **line, not a person**, and it is trivially spoofed: a pharmacy's handset is
+shared between shifts, so "we called you about X on Tuesday" can be correctly
+matched and still disclose the owner's business to a stranger.
 
 ## How to actually use it
 
@@ -116,6 +134,22 @@ a null in your result.
 ```
 
 Use nullable types (`["number","null"]`) for anything the person might not know.
+
+### Naming the words the line will destroy: `KEYWORDS`
+
+```bash
+KEYWORDS="Ozempic,semaglutyd,Wołoska" scripts/call.sh +48221234567 pl "..."
+```
+
+A phone line is 8 kHz, and it destroys exactly the words a call turns on: a drug
+name, a brand, a street, a part number, a surname. The recogniser is told to
+expect these, which is the cheapest quality improvement available on this system
+— and it is free.
+
+Use it whenever the answer hinges on a **proper noun rather than a yes/no**. If
+the call is "do you have X in stock", X belongs in `KEYWORDS`. Ordinary words do
+not: the recogniser already knows "parking" and "Tuesday", and a long list
+dilutes the ones that matter.
 
 ### Reading the result — the part that matters
 

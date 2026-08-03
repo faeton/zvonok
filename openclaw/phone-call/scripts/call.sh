@@ -2,7 +2,9 @@
 # Place one phone call. Returns immediately with a call_id — the conversation
 # has NOT finished when this returns (see SKILL.md).
 #
-#   call.sh <+E164> <ru|en|es> "<goal>" ['<answer_schema JSON>']
+#   call.sh <+E164> <ru|en|es|pl> "<goal>" ['<answer_schema JSON>']
+#
+# Optional env: INTRODUCE_AS, KEYWORDS (see SKILL.md).
 #
 # Example:
 #   call.sh +34911234567 es "Find out whether guests can park onsite and the
@@ -14,8 +16,8 @@ set -euo pipefail
 : "${ZVONOK_API_URL:?ZVONOK_API_URL is not set}"
 : "${ZVONOK_API_TOKEN:?ZVONOK_API_TOKEN is not set}"
 
-NUMBER="${1:?usage: call.sh <+E164> <ru|en|es> \"<goal>\" ['<answer_schema>']}"
-LANGUAGE="${2:?language must be ru, en or es}"
+NUMBER="${1:?usage: call.sh <+E164> <ru|en|es|pl> \"<goal>\" ['<answer_schema>']}"
+LANGUAGE="${2:?language must be ru, en, es or pl}"
 GOAL="${3:?a goal is required}"
 SCHEMA="${4:-}"
 
@@ -43,6 +45,13 @@ if schema.strip():
 introduce = os.environ.get("INTRODUCE_AS") or ""
 if introduce.strip():
     body["introduce_as"] = introduce.strip()
+# Optional: proper nouns to bias the recogniser toward (see SKILL.md). A phone
+# line is 8 kHz and destroys exactly the words a call turns on — a drug, a
+# brand, a part number — so naming them up front is the cheapest quality win
+# available. Comma-separated.
+keywords = [k.strip() for k in (os.environ.get("KEYWORDS") or "").split(",") if k.strip()]
+if keywords:
+    body["keywords"] = keywords
 print(json.dumps(body))
 ')
 

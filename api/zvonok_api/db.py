@@ -40,6 +40,44 @@ async def connect() -> asyncpg.Pool:
     return _pool
 
 
+async def backfill_job_tenants(mapping: dict[str, str]) -> int:
+    """Stamp `tenant` onto rows written before the column existed.
+
+    Idempotent, and only ever touches NULLs — a row that already knows its
+    tenant is never revised, because that stored value IS the record.
+
+    ⚠ This freezes TODAY's identity→tenant mapping onto history. That is correct
+    if the mapping has always been what it is now, and unrecoverable if it is
+    not: the mapping lives in env, so what an old job was actually admitted
+    under is simply not knowable from SQL. Running it promptly is the point —
+    the longer NULLs survive, the longer the exact defect `tenant_of` exists to
+    prevent stays reachable for those rows.
+    """
+    stamped = 0
+    for identity, tenant in mapping.items():
+        result = await pool().execute(
+            "UPDATE jobs SET tenant = $1 WHERE tenant IS NULL AND identity = $2",
+            tenant, identity,
+        )
+        stamped += int(result.rsplit(" ", 1)[-1] or 0)
+
+    orphans = await pool().fetchval(
+        "SELECT count(*) FROM jobs WHERE tenant IS NULL"
+    )
+    if orphans:
+        # Jobs whose identity no longer has a token. They keep the derived
+        # fallback, which for an unknown identity resolves to the default
+        # tenant — worth saying out loud rather than leaving to be discovered.
+        logger.warning(
+            "%d job(s) still have no tenant: their identity is no longer "
+            "configured, so accounting for them falls back to the default",
+            orphans,
+        )
+    if stamped:
+        logger.info("backfilled tenant on %d job(s)", stamped)
+    return stamped
+
+
 async def _register_json(conn: asyncpg.Connection) -> None:
     for typename in ("json", "jsonb"):
         await conn.set_type_codec(

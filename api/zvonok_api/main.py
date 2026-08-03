@@ -63,6 +63,12 @@ def new_call_id() -> str:
 async def lifespan(app: FastAPI):
     settings.require()
     await db.connect()
+    # Close the window where a job's tenant is still derived rather than stored.
+    # Runs after the schema is applied, so the column exists; idempotent, so a
+    # restart is free once there is nothing left to stamp.
+    await db.backfill_job_tenants(
+        {lim.identity: lim.tenant for lim in settings.limits.values()}
+    )
     task = asyncio.create_task(janitor.run_forever(), name="janitor")
     logger.info("call-api up: livekit=%s tenants=%d", settings.livekit_url, len(settings.tenants))
     for name, tenant in sorted(settings.tenants.items()):
@@ -142,8 +148,22 @@ def _job_for_worker(job: Mapping[str, Any] | None, job_id: str, tenant: str) -> 
     Not 403: distinguishing the two tells a caller that a job id is real and
     belongs to somebody else, which is the same disclosure `_job_or_404` refuses
     across identities.
+
+    The cost of that choice is debuggability — a worker holding the wrong token
+    sees "no such call" for every report it files, so calls complete on the
+    phone and never settle, which is expensive and reads like nothing at all. So
+    the distinction the wire does not carry goes in the log instead: operators
+    read logs, attackers do not.
     """
-    if job is None or settings.tenant_of(job).name != tenant:
+    if job is None:
+        raise HTTPException(404, f"no call {job_id}")
+    owner = settings.tenant_of(job).name
+    if owner != tenant:
+        logger.error(
+            "internal authz mismatch: worker_tenant=%s job_tenant=%s job_id=%s "
+            "— check ZVONOK_INTERNAL_TOKEN wiring for that worker",
+            tenant, owner, job_id,
+        )
         raise HTTPException(404, f"no call {job_id}")
     return job
 
