@@ -23,6 +23,7 @@ exactly as it was before tenants existed — nothing to change, nothing to break
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import secrets
@@ -31,6 +32,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .policy import CallerIds
+
+logger = logging.getLogger("zvonok.config")
 
 # The tenant every identity belongs to unless ZVONOK_TENANT_<IDENTITY> says
 # otherwise. Its config is the unsuffixed env, so an existing deployment is a
@@ -350,7 +353,31 @@ class Settings:
         name = job.get("tenant")
         if not name:
             return self.tenant_for(job["identity"])
-        return self.tenants.get(name) or _tenant(name)
+        known = self.tenants.get(name)
+        if known is not None:
+            return known
+        # A tenant that owns outstanding jobs but is no longer configured — its
+        # last token was revoked, or its block was deleted from .env while calls
+        # were still unextracted. `_own` does not inherit, so what comes back has
+        # blank credentials and fails at extraction rather than quietly using
+        # somebody else's key. That is the safe direction, but it is silent, and
+        # the operator's actual mistake was removing config too early.
+        logger.warning(
+            "job %s belongs to tenant %r, which is no longer configured — "
+            "it has no credentials, so extraction will fail until it is "
+            "restored", job.get("id", "?"), name,
+        )
+        return _tenant(name)
+
+    def worker_owns(self, job: Mapping[str, Any], tenant: str) -> bool:
+        """May a worker authenticated as `tenant` report on this job?
+
+        Lives here rather than in the endpoint because it is a pure statement
+        about tenancy, and because an authorization rule that can only be
+        exercised by standing up FastAPI, LiveKit and Postgres is a rule that
+        does not get tested.
+        """
+        return self.tenant_of(job).name == tenant
 
     def tenant_for_internal_token(self, token: str) -> str | None:
         """Which tenant's worker is calling, or None if the token is unknown."""

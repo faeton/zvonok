@@ -216,7 +216,8 @@ def test_tenant_config() -> None:
         except RuntimeError as e:
             no_token = str(e)
         expect("a tenant with no internal token fails startup",
-               "ZVONOK_INTERNAL_TOKEN_FRIEND" in no_token)
+               no_token.startswith("missing required env")
+               and "ZVONOK_INTERNAL_TOKEN_FRIEND" in no_token)
 
         # Sharing one is worse than forgetting one, because it works.
         os.environ["ZVONOK_INTERNAL_TOKEN_FRIEND"] = "internal-ours"
@@ -226,7 +227,8 @@ def test_tenant_config() -> None:
         except ValueError as e:
             shared = str(e)
         expect("two tenants sharing an internal token is fatal",
-               "internal token" in shared and "friend" in shared)
+               "internal token" in shared
+               and "friend" in shared and config.DEFAULT_TENANT in shared)
         os.environ["ZVONOK_INTERNAL_TOKEN_FRIEND"] = "internal-theirs"
 
         # A job's tenant is what it was ADMITTED under, not what its identity
@@ -239,9 +241,33 @@ def test_tenant_config() -> None:
                s.tenant_of(moved).name == "friend"
                and s.tenant_of(moved).xai_api_key == "theirs")
         expect("a row written before the column falls back to derived",
-               s.tenant_of({"identity": "friend"}).name == "friend")
+               s.tenant_of({"identity": "friend"}) == s.tenant_for("friend"))
         expect("tenant_for still answers for a call not yet placed",
                s.tenant_for("mac-claude").name == config.DEFAULT_TENANT)
+
+        # The rule the internal endpoints enforce. Before this, a worker's
+        # token proved only "some worker on this box" while the endpoint acted
+        # on whatever job id was in the URL — so one tenant's worker could
+        # settle another's call and have the transcript extracted against the
+        # victim's key.
+        theirs_job = {"id": "c_1", "identity": "friend", "tenant": "friend"}
+        ours_job = {"id": "c_2", "identity": "mac-claude", "tenant": config.DEFAULT_TENANT}
+        expect("a worker may report on its own tenant's job",
+               s.worker_owns(theirs_job, "friend")
+               and s.worker_owns(ours_job, config.DEFAULT_TENANT))
+        expect("a worker may NOT report on another tenant's job",
+               not s.worker_owns(theirs_job, config.DEFAULT_TENANT)
+               and not s.worker_owns(ours_job, "friend"))
+        # A legacy row still resolves, and still refuses the wrong worker.
+        legacy = {"id": "c_3", "identity": "friend"}
+        expect("a legacy row is still owned by the right tenant",
+               s.worker_owns(legacy, "friend")
+               and not s.worker_owns(legacy, config.DEFAULT_TENANT))
+        # A stored tenant nobody configured must not resolve to somebody else's
+        # credentials — it gets a blank tenant that fails at extraction.
+        orphan = s.tenant_of({"id": "c_4", "identity": "friend", "tenant": "gone"})
+        expect("an unconfigured stored tenant gets no credentials",
+               orphan.name == "gone" and not orphan.xai_api_key)
 
         expect("per-identity cap applies", s.limits_for("friend").daily_usd == 3.0)
         expect("unsuffixed cap still applies", s.limits_for("mac-claude").daily_usd == 10.0)

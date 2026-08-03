@@ -157,8 +157,8 @@ def _job_for_worker(job: Mapping[str, Any] | None, job_id: str, tenant: str) -> 
     """
     if job is None:
         raise HTTPException(404, f"no call {job_id}")
-    owner = settings.tenant_of(job).name
-    if owner != tenant:
+    if not settings.worker_owns(job, tenant):
+        owner = settings.tenant_of(job).name
         logger.error(
             "internal authz mismatch: worker_tenant=%s job_tenant=%s job_id=%s "
             "— check ZVONOK_INTERNAL_TOKEN wiring for that worker",
@@ -215,8 +215,15 @@ async def _enforce_caps(
     mine = [j for j in open_jobs if j["identity"] == identity]
     reserved_seconds = sum(j["max_duration_seconds"] for j in mine)
     reserved_usd = sum(
+        # tenant_of(j), not the requesting identity's tenant: these are jobs
+        # that already exist, and pricing depends on the ORIGIN group of the
+        # caller ID they were admitted with. If the identity has since been
+        # remapped, pricing them through today's tenant reclassifies calls that
+        # are already in flight — the same re-derivation defect this column was
+        # added to close, in the one place that still had it.
         policy.estimate_usd(
-            j["country"], j["max_duration_seconds"], j["caller_id"], tenant.caller_ids
+            j["country"], j["max_duration_seconds"], j["caller_id"],
+            settings.tenant_of(j).caller_ids,
         )
         for j in mine
     )

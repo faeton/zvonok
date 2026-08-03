@@ -1275,6 +1275,27 @@ the class is worth listing rather than trusting:
     generate the per-tenant compose service. Not urgent at two tenants; it is the
     thing that will bite at three.
 
+11. **Nothing binds a job's tenant to the trunk that actually dials it.** Named
+    by Grok as the next *working call, wrong bill*, and it is the honest limit of
+    what §5.7 currently guarantees. Placement isolation is still only
+    `agent_name` → whichever process registered that name → that process's
+    `SIP_OUTBOUND_TRUNK_ID`. The API never records the trunk on the job, and
+    nothing at dial time asserts that the worker's trunk matches `jobs.tenant`.
+    Three ways to reach it, all silent: worker env drift, a name registered at
+    LiveKit that differs from the configured one (`require()` checks *config*,
+    not who actually registered), and an identity whose `ZVONOK_TENANT_<IDENTITY>`
+    is simply unset — it becomes the default tenant, so every carefully set
+    `_FRIEND` variable sits unused while their calls leave on our trunk. Fix:
+    record the trunk id on the job at dispatch and have the worker refuse a job
+    whose trunk is not its own.
+
+12. **The janitor's disk recovery bypasses the internal token entirely.** It
+    reads the shared transcript directory and finalises by job id, so it is the
+    one remaining path that can settle a call and trigger extraction without
+    presenting a tenant's token at all. Lower priority than 11 because it
+    misattributes rather than dials, but it is the surviving hole in the fix
+    above and should not be rediscovered later as a surprise.
+
 ## 11. In-house prior art (found 2026-07-27)
 
 - **onova** (`~/Sites/onova`) contains a **working LiveKit Agents voice agent** — TypeScript, `@livekit/agents` + `agents-plugin-deepgram` (nova-3 STT) + OpenAI LLM/TTS: a voice *interview* agent with an `llm.tool` `save_answer` pattern (per-question summary + raw transcript persisted via session userData), core-api issuing LiveKit tokens, dashboard room component, compose wiring for `LIVEKIT_URL/API_KEY/SECRET` (server was external — likely LiveKit Cloud; no self-hosted livekit-server in its compose). This validates familiarity with the framework and is directly reusable for zvonok's agent structure: the tool-calling + structured-persistence pattern is exactly our transcript/answers flow, minus SIP.
