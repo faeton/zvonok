@@ -525,8 +525,12 @@ async def entrypoint(ctx: JobContext) -> None:
     language = meta.get("language", "en")
     caller_id = meta.get("caller_id")
     job_id = meta.get("job_id") or ctx.job.id
-    # "light" by default (§8): the storage fact in plain words. call-api picks
-    # this from a policy table; here it is simply passed through.
+    # call-api picks the level from a policy table and its default is now
+    # `brief` (§8.1). This fallback deliberately does NOT follow it: reaching
+    # here means call-api sent no level at all — an older API, or a hand-rolled
+    # dispatch — and the honest reading of "nobody told us" is to say MORE than
+    # the minimum, not less. `light` is the conservative answer to ignorance;
+    # `brief` is a decision, and nothing here is in a position to make it.
     disclosure_level = meta.get("disclosure_level", "light")
     if disclosure_level not in DISCLOSURE_LEVELS:
         logger.warning("unknown disclosure_level %r — using light", disclosure_level)

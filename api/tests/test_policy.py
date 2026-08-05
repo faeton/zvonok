@@ -750,6 +750,26 @@ def test_disclosure_delivered() -> None:
                  "text": "Здравствуйте, это AI-ассистент, записываю ответ."}],
                "ru", "brief"))
 
+    # ⚠ The retention stems must not be satisfiable by an unrelated word that
+    # happens to be a PREFIX of one. The first version reused `_heard`, which
+    # prefix-matches both ways, so the stem "stored" was satisfied by the plain
+    # English noun "store" — and the canvass question we ask is literally "do
+    # you have Royal Pop in the store right now". The guard proving we said the
+    # answer is kept was being passed by the question.
+    expect("the noun 'store' does not stand in for 'stored'",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Hello, this is an AI assistant, I'll the answer down. "
+                         "Do you have Royal Pop in the store?"}], "en", "brief"))
+    # The real line plus that same question must still pass, or the fix bought
+    # correctness by breaking every canvass call.
+    expect("the real line survives the same question",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": prompts.disclosure_for("en", "brief")
+                         + " Do you have Royal Pop in the store right now?"}],
+               "en", "brief"))
+
     # The canvass prompt is a separate template, not the long one with sections
     # switched off — and every word of it is paid for on a cold first turn.
     canvass = prompts.build_instructions("Ask if they stock X.", "pl",
@@ -806,9 +826,11 @@ def test_prior_attempt() -> None:
 
     now = datetime(2026, 8, 4, 18, 10, tzinfo=timezone.utc)
 
-    def row(minutes: int, achieved: bool = False, job_id: str = "c_old"):
+    def row(minutes: int, achieved: bool = False, job_id: str = "c_old",
+            disposition: str = "callee_hangup"):
         return {"id": job_id,
                 "created_at": now - timedelta(minutes=minutes),
+                "disposition": disposition,
                 "goal_achieved": achieved}
 
     expect("no history means no line", policy.prior_attempt_note([], now) is None)
@@ -833,6 +855,19 @@ def test_prior_attempt() -> None:
     # -3 minutes ago".
     expect("a future timestamp is ignored",
            policy.prior_attempt_note([row(-3)], now) is None)
+    # A NULL goal_achieved is not evidence of failure — the extractor may simply
+    # not have run yet. Decided by the disposition, not guessed. Calls that died
+    # on the introduction have nothing to extract and land here, which is the
+    # case worth apologising for; a finished call still being read is not.
+    expect("null goal_achieved with a failed disposition still counts",
+           policy.prior_attempt_note(
+               [row(8, achieved=None, disposition="no_audio")], now) is not None)
+    expect("null goal_achieved mid-extraction is not apologised for",
+           policy.prior_attempt_note(
+               [row(8, achieved=None, disposition=None)], now) is None)
+    expect("a call still in flight is not apologised for",
+           policy.prior_attempt_note(
+               [row(2, achieved=None, disposition="in_progress")], now) is None)
 
 
 if __name__ == "__main__":

@@ -276,6 +276,29 @@ _RETENTION_STEMS = {
 }
 
 
+def _grew_from(stem: str, said: list[str]) -> bool:
+    """Did a spoken word GROW from this stem? One direction only.
+
+    ⚠ NOT `_heard`. That one prefix-matches both ways, which is right for
+    matching a template word against a mangled transcript and catastrophically
+    wrong here. `_heard("stored", ["store"])` is True, because "stored" starts
+    with "store" — so the retention stem `stored` was satisfied by the ordinary
+    English noun, and our own canvass question is "do you have Royal Pop in the
+    STORE right now". The check that exists to prove we said the answer is kept
+    was being passed by the word "store" in the question:
+
+        "Hello, this is an AI assistant, I'll the answer down.
+         Do you have Royal Pop in the store?"        → counted as delivered
+
+    A stem is a beginning. Inflection only ever adds to the end — "запишу",
+    "записywana", "anotaré" — so the SAID word must start with the STEM, never
+    the reverse. Reversing it lets any shorter unrelated word stand in for a
+    longer stem, which is exactly the false positive this whole section exists
+    to prevent.
+    """
+    return any(s.startswith(stem) for s in said)
+
+
 def _kept_the_retention_fact(language: str, said: list[str]) -> bool:
     """Did this turn actually say the answer is kept?
 
@@ -283,7 +306,7 @@ def _kept_the_retention_fact(language: str, said: list[str]) -> bool:
     a pass on the half of §8 that is about retention.
     """
     stems = _RETENTION_STEMS.get(language, _RETENTION_STEMS["en"])
-    return any(_heard(s, said) for stem in stems for s in _fold(stem))
+    return any(_grew_from(s, said) for stem in stems for s in _fold(stem))
 
 
 def disclosure_delivered(
@@ -493,12 +516,12 @@ If the goal asks several things, they are ordered: ask the first, wait for the a
 The moment a HUMAN speaks, say this and only this, in one breath:
 "{disclosure_for(language, disclosure_level)} <your question>"
 
-This first turn is fixed. Whatever you think you heard, you say this. Do not react to their greeting, do not comment on it, and never answer it.
+This first turn is fixed. Whatever you think you heard, you say this. Do not react to their greeting, do not comment on it, and never answer it. The ONE thing that changes it is a "You have rung them already" section above: if there is one, its sentence goes in front of this line, and the rest still follows word for word.
 
 ## What you never do
 You are not a helpline. Never explain, advise, instruct, or answer a question of theirs. On an 8 kHz line you will sometimes hear a fluent sentence nobody said — often in another language, often a question. The tell is that it does not fit: a business does not answer its own phone by asking YOU for advice. When it does not fit, you misheard, so ask your question again instead of replying to it.
 
-No small talk, no offering help, no apologising for calling, no asking the same thing twice in different words. Do not give your name unless asked (it is {ident['assistant']}).
+No small talk, no offering help, no apologising for calling, no asking the same thing twice in different words. (The one exception is the "You have rung them already" section, if there is one — there, saying so IS the job.) Do not give your name unless asked (it is {ident['assistant']}).
 
 ## Are they even the right place
 If the goal names the business you were told to call, and whoever answers names a plainly different one, you have the wrong number: say sorry, you were calling <business>, then mark_unreachable "wrong_number". Do not ask your question anyway. An 8 kHz line mangles business names, so a name you merely did not catch is not a mismatch — if you are unsure, ask once whether you have reached them, and believe their answer.

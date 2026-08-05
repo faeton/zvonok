@@ -274,6 +274,15 @@ def estimate_usd(
 # person will not remember it, and reminding them is worse than not.
 PRIOR_ATTEMPT_WINDOW_SECONDS = 2 * 60 * 60
 
+# Dispositions that mean the call produced nothing, used only to decide what a
+# NULL `goal_achieved` meant. Deliberately excludes `goal_achieved` and the
+# in-flight states: an unfinished call is not a failed one, and the next dial
+# should not apologise for a call that is still going.
+_GOT_NOWHERE = frozenset({
+    "no_answer", "no_audio", "invalid_number", "unreachable", "failed",
+    "callee_hangup", "timed_out", "setup_failed", "voicemail", "ivr_deadend",
+})
+
 
 def prior_attempt_note(
     rows: list[dict[str, Any]], now: datetime, exclude_job_id: str | None = None
@@ -296,8 +305,22 @@ def prior_attempt_note(
     for row in rows:
         if exclude_job_id and row.get("id") == exclude_job_id:
             continue
-        if row.get("goal_achieved"):
-            return None  # the most recent call worked; nothing to apologise for
+        # `goal_achieved` is THREE-valued and each value means something
+        # different here. True: the call got its answer, so there is nothing to
+        # apologise for. False: it demonstrably did not. NULL: the extractor has
+        # not run or was skipped — which is not evidence either way, and is
+        # exactly what a call that died on the introduction looks like, because
+        # there is nothing to extract from two turns of nobody answering.
+        #
+        # So NULL is decided by the disposition instead of guessed. Getting this
+        # wrong in the lenient direction means opening "sorry, we were cut off"
+        # to someone who answered us perfectly well, which invites "no we
+        # weren't, and I already told you" — worse than saying nothing.
+        achieved = row.get("goal_achieved")
+        if achieved is True:
+            return None
+        if achieved is None and row.get("disposition") not in _GOT_NOWHERE:
+            return None
         created = row.get("created_at")
         if not created:
             continue
