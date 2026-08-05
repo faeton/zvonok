@@ -838,10 +838,25 @@ async def entrypoint(ctx: JobContext) -> None:
         # announcement keeps the grace alive rather than exhausting it — bounded
         # by QUEUE_PATIENCE_TOTAL in the watchdog.
         if speaker == "user" and looks_like_menu(text):
+            # ⚠ SHUT UP AS WELL AS WAIT. Detecting the announcement does not stop
+            # us answering it: the realtime model's server VAD has create_response
+            # on, so it starts replying the moment the recording pauses, while
+            # this handler only runs once the words have been TRANSCRIBED — about
+            # eleven seconds later on a real call. Measured, in that order:
+            #
+            #   :07.7  callee spoke first (the announcement)
+            #   :18.6  menu or hold detected — waiting quietly for up to 60s
+            #   :19.7  ...and the agent said its whole line to the tape anyway
+            #
+            # Which cost the question twice over: spent on a recording, then
+            # repeated over the top of the human who finally picked up. The wait
+            # below is correct and was never the problem; the missing half is
+            # cancelling the reply already in flight.
+            session.interrupt()
             if not queued_since:
                 queued_since = time.monotonic()
             queued_until = time.monotonic() + QUEUE_PATIENCE_SECONDS
-            logger.info("menu or hold detected — waiting quietly for up to %.0fs",
+            logger.info("menu or hold detected — hushed, waiting quietly for up to %.0fs",
                         QUEUE_PATIENCE_SECONDS)
         elif speaker == "user" and queued_since:
             # Someone who is not a recording is on the line: the queue is over.
