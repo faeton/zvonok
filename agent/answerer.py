@@ -59,13 +59,47 @@ MENU_PHRASES = (
     "aby połączyć", "aby uzyskać", "aby porozmawiać", "wybierz jeden",
 )
 
+# A recording that offers no options and invites no message, but tells you to
+# wait. It is neither a menu nor voicemail, and until a Figueres pharmacy proved
+# it we had no category for it: the agent heard a machine reading its opening
+# hours, took it for the person who had answered, and spent its whole question
+# on a tape. Fifteen seconds later a human said "digui" and got a second
+# introduction that collided with them, and the call died in the overlap.
+#
+#   "Està trucant a Farmàcia Soler. El nostre horari és de dilluns a dissabte…
+#    En breus moments l'atendrem. Gràcies."
+#
+# Catalan, because these are Catalan pharmacies — Figueres, Girona, Barcelona.
+# We keep speaking Spanish there (everyone understands it), but we have to
+# RECOGNISE what the machine says, and this list is the only place that matters.
+# The Spanish forms are here too: the same recording exists in both.
+HOLD_PHRASES = (
+    # ca
+    "en breus moments", "l'atendrem", "atendrem de seguida", "esperi un moment",
+    "un moment si us plau", "el nostre horari", "no pengi",
+    # es
+    "en breves momentos", "le atenderemos", "les atenderemos",
+    "espere un momento", "un momento por favor", "nuestro horario",
+    "no cuelgue", "su llamada es importante",
+    # en / ru / pl, for the same recording elsewhere
+    "please hold", "hold the line", "be with you shortly", "our opening hours",
+    "оставайтесь на линии", "ожидайте ответа", "наш режим работы",
+    "prosimy czekać", "prosimy czekac", "godziny otwarcia",
+)
+
 # Matched on WORD BOUNDARIES, not as substrings, and the trailing \b is the half
 # that does the work: "pressure" starts on a word boundary too. A plain
 # `"press" in text` classified the ASR hallucination "How to take a pressure?"
 # as an IVR menu and bought that call sixty seconds of patient silence — on a
 # line where nobody had said anything of the sort.
+#
+# HOLD_PHRASES ride the same regex because they drive the same behaviour: both
+# mean "a machine is talking, stay silent, a human is coming". agent.py's log
+# line has said "menu or hold detected" all along; only the hold half was
+# missing.
 _MENU_RE = re.compile(
-    r"\b(?:%s)\b" % "|".join(re.escape(p) for p in MENU_PHRASES), re.IGNORECASE
+    r"\b(?:%s)\b" % "|".join(re.escape(p) for p in MENU_PHRASES + HOLD_PHRASES),
+    re.IGNORECASE,
 )
 
 # Hold music is not silence to a recogniser: it produces a steady drip of short,

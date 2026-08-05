@@ -876,6 +876,28 @@ def test_answerer() -> None:
     expect("'depressed' is NOT a menu",
            not answerer.looks_like_menu("she sounded depressed"))
 
+    # ⚠ A Catalan pharmacy hold announcement, transcribed off a real call. It is
+    # not a menu (no options) and not voicemail (no message invited), so nothing
+    # matched it: the agent took the tape for the person, spent its whole
+    # question on it, and then collided with the human who picked up fifteen
+    # seconds later. Both calls died in that overlap.
+    hold_ca = ("Está trucando a Farmacia Sule. El nuestre horari és de dilluns "
+               "a dissabte de vuit i mitja del matí a vuit i mitja del vespre. "
+               "En breus moments l'atendrem. Gràcies.")
+    expect("a Catalan hold announcement is a queue, not a person",
+           answerer.looks_like_menu(hold_ca))
+    expect("...and is not mistaken for voicemail",
+           not answerer.looks_like_voicemail(hold_ca))
+    expect("the Spanish form counts too",
+           answerer.looks_like_menu("En breves momentos le atenderemos"))
+    expect("'no cuelgue' is a queue",
+           answerer.looks_like_menu("Su llamada es importante, no cuelgue"))
+    # ...without swallowing the human who actually answers.
+    expect("a real Catalan greeting is still a person",
+           not answerer.looks_like_menu("Farmàcia Soler, digui."))
+    expect("a real Spanish greeting is still a person",
+           not answerer.looks_like_menu("Farmacia, buenas tardes."))
+
 
 def test_prior_attempt() -> None:
     print("prior attempt note")
