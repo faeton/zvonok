@@ -9,7 +9,7 @@ Two kinds of text live here and they are not the same kind of thing:
                  impatient human and line noise.
   INSTRUCTIONS — the system prompt. Judgment, in prose, for a model to apply.
 
-The module is pure text and `os.getenv`. It deliberately imports nothing from
+The module is text, `os.getenv` and the standard library. It imports nothing from
 LiveKit or the realtime stack: this is the part that changes after every call
 that goes wrong, and it must be testable in a bare interpreter.
 
@@ -22,6 +22,8 @@ agent that promises a confirmation, never one that invents a name.
 from __future__ import annotations
 
 import os
+import re
+import unicodedata
 from typing import Any
 
 # Names are spelled for PRONUNCIATION, not for paperwork: a Cyrillic "Иван" is
@@ -63,7 +65,8 @@ IDENTITY = {
         # Polish has no native "v": the model reads "Klava" as a foreign word and
         # transcription comes back "Klawa" about as often as not — which the
         # disclosure check would then fail to recognise. Spelled the Polish way
-        # by default, with assistant_variants() covering the other spelling.
+        # by default; the delivery check folds w and v together, so either
+        # transcription satisfies it.
         "assistant": os.getenv("ZVONOK_ASSISTANT_NAME_PL", "Klawa"),
         "owner": os.getenv("ZVONOK_OWNER_NAME", ""),
         "owner_full": os.getenv("ZVONOK_OWNER_FULLNAME", ""),
@@ -169,73 +172,197 @@ def disclosure_for(
 
 
 # --- did the disclosure actually land? --------------------------------------
+#
+# Checked against THE LINE WE ASKED FOR, clause by clause — not against
+# dictionaries of words meaning "AI" and "kept" in four languages. Those
+# dictionaries were wrong in two ways that only surfaced when someone went
+# looking, and both were silent:
+#
+#   · They were never scoped to the call's language. Every language's words were
+#     accepted for every call, so at `brief` — where no name is required — a
+#     disclosure in any of the four satisfied a call in any other.
+#   · They could not tell `full` from `light`. Both levels were checked with the
+#     same two lists, so a light introduction, which never says the call is
+#     STORED and never offers to stop, closed the guard on a call designated
+#     `full` precisely because it commits on someone's behalf.
+#
+# Matching the known line fixes both, and turns the Klava/Klawa spelling hack
+# into ordinary normalisation. What this must NOT become is one similarity score
+# over the whole sentence: the disclosure carries two separable facts — you are
+# talking to an AI, and what you say is kept — and dropping the retention clause
+# costs a small fraction of the words but half of §8. So the unit is the CLAUSE,
+# and every clause of the expected line has to land in the same breath.
+#
+# The bias is deliberate. A false negative makes the guard say the line a second
+# time, which is rude. A false positive records a §8 disclosure that never
+# happened. When the threshold is in doubt, be rude.
 
-# Words that mean "what you say is being kept". Every level must convey this —
-# the point of the levels is register, not content.
-_STORAGE_WORDS = (
-    "note down", "note the answer", "make a note", "transcrib", "recorded", "stored",
-    "запишу", "записыв", "транскриб", "сохран",
-    "anotar", "anotaré", "transcrib", "guarda",
-    "zanotuj", "zanotuję", "zapisz", "zapiszę", "transkryb", "notuj",
-)
-_AI_WORDS = (
-    "ai assistant", "ai-ассистент", "ai ассистент", "asistente de ia",
-    "asystent ai", "asystentka ai",
-)
+# Share of a clause's words that must show up for it to count as spoken. Not
+# 1.0: an 8 kHz alaw line reliably eats a word or two of anything this long.
+_CLAUSE_RECALL = 0.75
+
+_SENTENCE_END = re.compile(r"[.!?…]+")
 
 
-def assistant_variants(name: str) -> set[str]:
-    """Spellings of the assistant's name that count as "it said its name".
+def _fold(text: str) -> list[str]:
+    """Lowercase, drop accents and punctuation, fold w→v, split into words.
 
-    Polish has no native "v", so a spoken "Klawa" comes back transcribed as
-    "Klava" roughly as often as the other way round. Requiring an exact match
-    would make the disclosure look undelivered on a call where it plainly was,
-    and the guard would then talk over the callee to repeat it.
+    Both sides of every comparison go through this, so each fold can only ever
+    remove a distinction — never invent a match the raw strings could not
+    support. The w→v fold lives here rather than in a per-name variants table
+    because it is an artefact of the recogniser, not a fact about the name:
+    Polish has no native "v", so a spoken "Klawa" comes back transcribed either
+    way, and so does every other foreign word on the call.
     """
-    low = name.lower()
-    return {low, low.replace("w", "v"), low.replace("v", "w")}
+    decomposed = unicodedata.normalize("NFKD", text.lower().replace("w", "v"))
+    bare = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return "".join(c if c.isalnum() else " " for c in bare).split()
+
+
+def _heard(word: str, said: list[str]) -> bool:
+    """Is this word in what was transcribed, allowing for a mangled ending?
+
+    A phone line degrades endings long before it degrades stems, and every
+    language here except English inflects heavily, so "zanotuję" / "zanotuje" /
+    "zanotowałam" have to count for each other. Prefix matching is capped below
+    four characters, where it would start matching function words to each other.
+    """
+    if word in said:
+        return True
+    if len(word) < 4:
+        return False
+    return any(
+        len(s) >= 4 and (s.startswith(word) or word.startswith(s)) for s in said
+    )
+
+
+def _clauses(line: str) -> list[list[str]]:
+    """The expected line, split into the units that carry a fact each."""
+    parts = (_fold(c) for c in _SENTENCE_END.split(line))
+    return [p for p in parts if len(p) >= 2]
+
+
+def _spoke_clause(clause: list[str], said: list[str]) -> bool:
+    return sum(1 for w in clause if _heard(w, said)) / len(clause) >= _CLAUSE_RECALL
+
+
+# The retention fact, as stems, because word recall alone cannot protect it.
+#
+# ⚠ WHY THIS EXISTS. `_spoke_clause` scores a clause by the SHARE of its words
+# that came back, which spreads the weight evenly over "здравствуйте", "это",
+# "AI-ассистент" and "запишу". The three §8 levels are not equally exposed to
+# that: `full` puts retention in a sentence of its own, so losing it fails the
+# clause outright, but `brief` is ONE sentence in every language, and `light`'s
+# retention half is short. Measured against the real templates, dropping the
+# storage verb alone still cleared 0.75 in ru, pl and es:
+#
+#   "Здравствуйте, это AI-ассистент, ответ."      → 5 of 6 words → counted
+#   "Dzień dobry, tu asystent AI, odpowiedź."     → counted
+#   "Hola, soy un asistente de IA, la respuesta." → counted
+#
+# In each the callee was told a machine was calling and never told the answer is
+# kept — half of §8 missing, and the guard satisfied, so it would never make the
+# agent say it again. English survived only by being wordier, which is luck, not
+# design. So the fact gets its own requirement: whatever else matched, at least
+# one of these stems has to have been heard in that same turn.
+#
+# Stems, not words, because `_heard` prefix-matches and every language here
+# inflects the verb ("запишу" / "записываю", "zanotuję" / "zapisywana").
+_RETENTION_STEMS = {
+    "en": ("note", "noting", "transcrib", "stored", "storing", "record"),
+    "ru": ("запиш", "записыва", "транскрибир", "сохран", "храни"),
+    "es": ("anotar", "anoto", "transcrib", "guard"),
+    "pl": ("zanotuj", "notuj", "zapis", "transkryb"),
+}
+
+
+def _kept_the_retention_fact(language: str, said: list[str]) -> bool:
+    """Did this turn actually say the answer is kept?
+
+    Falls back to English rather than to "yes": an unknown language must not buy
+    a pass on the half of §8 that is about retention.
+    """
+    stems = _RETENTION_STEMS.get(language, _RETENTION_STEMS["en"])
+    return any(_heard(s, said) for stem in stems for s in _fold(stem))
 
 
 def disclosure_delivered(
-    turns: list[dict[str, Any]], language: str, level: str = "light"
+    turns: list[dict[str, Any]],
+    language: str,
+    level: str = "light",
+    introduce_as: str | None = None,
+    also_languages: tuple[str, ...] = (),
 ) -> bool:
     """Did a complete disclosure actually get spoken, in one piece?
 
-    Checked against what the agent SAID, not what it intended. Requires, in a
-    single uninterrupted turn: that it is an AI, that the answer is being kept,
-    and — at `light` and `full` — the assistant's name.
-
-    The owner is deliberately NOT required at any level: the introduction names a
-    role ("assistant of a potential client"), not a person.
-
-    At `brief` the assistant's own name is not required either, because the brief
-    disclosure does not contain one. Keeping the name in this check while
-    removing it from the line the agent speaks would leave the guard convinced
-    the disclosure never landed, and it would cut across the callee to say it
-    again — the exact failure this function exists to prevent.
+    Checked against what the agent SAID, not what it intended: every clause of
+    `disclosure_for(language, level, introduce_as)` has to land inside a SINGLE
+    uninterrupted assistant turn, and at `light` and `full` the assistant's name
+    has to be in that same turn.
 
     ⚠ The `interrupted` check is the part that makes this true rather than merely
-    claimed. Without it the function only matched substrings, so an introduction
-    cut off mid-sentence still counted as delivered, because the stored turn text
+    claimed. Without it the function only matched text, so an introduction cut
+    off mid-sentence still counted as delivered, because the stored turn text
     contains words the callee never heard.
+
+    Pass the call's `introduce_as`. The guard compares against the exact line it
+    would force, and a custom principal that the checker does not know about
+    reads as a clause that never landed.
+
+    A disclosure STRONGER than the one asked for also counts; a weaker one never
+    does. `full` is not a superset of `light`'s wording, only of its meaning, so
+    the levels at or above the requested one are each tried in full.
+
+    The owner is deliberately NOT required at any level: the introduction names a
+    role ("assistant of a potential client"), not a person. At `brief` the
+    assistant's own name is not required either, because the brief line does not
+    contain one — demanding it here while removing it from what the agent speaks
+    would leave the guard convinced the disclosure never landed, and it would cut
+    across the callee to say it again.
+
+    `also_languages` covers the mid-call switch: the conversational prompt tells
+    the agent to change language when the callee plainly answers in another one,
+    and to give its introduction again there. Without it the guard would judge a
+    Polish call by its Russian line and talk over someone who had just heard the
+    disclosure. Note what this does NOT re-open — a switched-language disclosure
+    counts only as a COMPLETE line in that language, never as a stray word from
+    it. A custom `introduce_as` is not carried across, because the model would
+    have translated it and we cannot; an unusual principal costs one re-say.
     """
-    ident = identity_for(language)
+    langs = [(language, introduce_as)]
+    langs += [(lang, None) for lang in also_languages if lang != language]
+    # The levels are ordered by strength, and a stronger disclosure always
+    # satisfies a weaker requirement — `full` says everything `light` says and
+    # then some. It has to be spelled out because the levels are not each other's
+    # substrings: `full` says the call is "transcribed and stored" where `light`
+    # says "I'll note down your answer", so matching the requested wording alone
+    # would send the guard in to re-say the shorter line over a callee who had
+    # just heard the longer one.
+    try:
+        levels = DISCLOSURE_LEVELS[DISCLOSURE_LEVELS.index(level):]
+    except ValueError:  # unknown level — hold it to the default
+        levels = DISCLOSURE_LEVELS[DISCLOSURE_LEVELS.index("light"):]
+    expected = [
+        (lvl, lang, _clauses(disclosure_for(lang, lvl, intro)),
+         identity_for(lang)["assistant"])
+        for lang, intro in langs
+        for lvl in levels
+    ]
 
     for t in turns:
-        if t["speaker"] != "assistant":
+        if t["speaker"] != "assistant" or t.get("interrupted"):
             continue
-        if t.get("interrupted"):
-            continue
-        low = t["text"].lower()
-        if level != "brief" and not any(
-            v in low for v in assistant_variants(ident["assistant"])
-        ):
-            continue
-        if not any(a in low for a in _AI_WORDS):
-            continue
-        if not any(s in low for s in _STORAGE_WORDS):
-            continue
-        return True
+        said = _fold(t["text"])
+        for lvl, lang, clauses, name in expected:
+            if lvl != "brief" and not all(_heard(w, said) for w in _fold(name)):
+                continue
+            # Both halves of §8, separately. Clause recall alone lets the short
+            # templates lose the retention verb and still pass — see
+            # _RETENTION_STEMS for the three languages that measurably did.
+            if not _kept_the_retention_fact(lang, said):
+                continue
+            if clauses and all(_spoke_clause(c, said) for c in clauses):
+                return True
     return False
 
 
@@ -330,6 +457,7 @@ def build_canvass_instructions(
     *,
     disclosure_level: str = "brief",
     answer_schema: dict[str, Any] | None = None,
+    prior_attempt: str | None = None,
 ) -> str:
     """The one-question canvass prompt: short on purpose.
 
@@ -347,13 +475,19 @@ def build_canvass_instructions(
     """
     ident = identity_for(language)
     lang_name = LANGUAGE_NAMES.get(language, "English")
+    # Empty for almost every call, and deliberately rendered as nothing at all
+    # rather than an empty heading the model might try to fill.
+    already = f"\n## You have rung them already\n{prior_attempt}\n" if prior_attempt else ""
 
-    return f"""You are an {ident['role']} making a short phone call for a client. ONE question, one answer, then you hang up. Under a minute.
+    return f"""You are an {ident['role']} making a short phone call for a client. A couple of questions, then you hang up. Under a minute.
+{already}
 
 ## Your question
 {goal}
 
 This is written for you, not to be read out. Ask it in your own words, in the second person, one thing at a time.
+
+If the goal asks several things, they are ordered: ask the first, wait for the answer, then ask the next only if that answer makes it worth asking. Never stack two questions into one breath.
 {facts_block(answer_schema, brief=True)}
 ## What you say first
 The moment a HUMAN speaks, say this and only this, in one breath:
@@ -365,6 +499,9 @@ This first turn is fixed. Whatever you think you heard, you say this. Do not rea
 You are not a helpline. Never explain, advise, instruct, or answer a question of theirs. On an 8 kHz line you will sometimes hear a fluent sentence nobody said — often in another language, often a question. The tell is that it does not fit: a business does not answer its own phone by asking YOU for advice. When it does not fit, you misheard, so ask your question again instead of replying to it.
 
 No small talk, no offering help, no apologising for calling, no asking the same thing twice in different words. Do not give your name unless asked (it is {ident['assistant']}).
+
+## Are they even the right place
+If the goal names the business you were told to call, and whoever answers names a plainly different one, you have the wrong number: say sorry, you were calling <business>, then mark_unreachable "wrong_number". Do not ask your question anyway. An 8 kHz line mangles business names, so a name you merely did not catch is not a mismatch — if you are unsure, ask once whether you have reached them, and believe their answer.
 
 ## Who picked up
 - **A person** — says something short and stops. Speak your line above.
@@ -380,8 +517,10 @@ If asked whether you are an AI, say yes plainly. Never claim to be a person. If 
 
 A "what?" or a syllable you did not catch is confusion, not refusal — say your line once more, shorter.
 
+Your opening is deliberately short. If they ask who is calling, who you are calling for, or what happens to what they say, THEN give the longer version: that you are {ident['assistant']}, an AI assistant calling for a client, and that the call is transcribed and stored. Save it for someone who asked — said up front to someone who did not, it costs the seconds the call needs.
+
 ## Finishing
-Any answer ends the call, including "no" and "we don't know". Read the one fact back, call record_answer, thank them in three words, call end_call. A fifteen-second "no" is a success."""
+When the goal's questions are answered — or the first answer makes the rest pointless, which "no, we don't have it" usually does — read the facts back, call record_answer, thank them in three words, call end_call. Do not keep a person on the line for a question whose answer you can already infer. A fifteen-second "no" is a success."""
 
 
 def build_instructions(
@@ -392,6 +531,7 @@ def build_instructions(
     disclosure_level: str = "light",
     answer_schema: dict[str, Any] | None = None,
     introduce_as: str | None = None,
+    prior_attempt: str | None = None,
 ) -> str:
     """The conversational system prompt.
 
@@ -407,6 +547,7 @@ def build_instructions(
             goal, language,
             disclosure_level=disclosure_level,
             answer_schema=answer_schema,
+            prior_attempt=prior_attempt,
         )
 
     ident = identity_for(language)
@@ -418,6 +559,11 @@ def build_instructions(
     # went in they became unreachable, and unreachable branches that LOOK like
     # the brief path are a trap — the next safety fix gets written into them and
     # silently never runs on a real canvass call.
+    # Same block as the canvass template, same reason: rendered as nothing at
+    # all when there is no earlier call, so the model is never shown an empty
+    # heading and never invents a previous conversation to fill it.
+    already = f"\n## You have rung them already\n{prior_attempt}\n" if prior_attempt else ""
+
     opening = (
         f"""You are {ident['assistant']}, an {ident['role']} making a phone call on behalf of a client. On this call you introduce yourself as the {ident['role']} of {on_behalf} — that phrasing is what you lead with. Do not volunteer the client's name before the conversation actually needs it (see "Your principal's details")."""
     )
@@ -453,7 +599,7 @@ disclosure with extra reassurance — that is what makes people uneasy."""
     )
 
     return f"""{opening}
-
+{already}
 ## Goal
 {goal}
 

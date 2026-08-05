@@ -371,6 +371,21 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         },
     )
 
+    # Have we already rung this number and got nowhere? Read AFTER the job row
+    # exists, so `exclude_job_id` has something to exclude — otherwise the call
+    # we are about to place is itself the most recent unsuccessful attempt and
+    # the agent opens by apologising for its own call.
+    prior_attempt = policy.prior_attempt_note(
+        [dict(r) for r in await db.calls_to_number(
+            identity, destination.number, limit=3
+        )],
+        datetime.now(timezone.utc),
+        exclude_job_id=job_id,
+    )
+    if prior_attempt:
+        logger.info("job %s: recent unsuccessful call to %s — telling the agent",
+                    job_id, destination.number)
+
     metadata = {
         "job_id": job_id,
         # So the worker can refuse a job that is not its account's. `agent_name`
@@ -391,6 +406,9 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         # Fed to the agent as well as to the extractor: otherwise the agent never
         # thinks to ASK for a field the schema requires (BRIEF §9 trap 8).
         "answer_schema": req.answer_schema,
+        # None on the overwhelming majority of calls; the agent omits the line
+        # entirely rather than printing an empty section.
+        "prior_attempt": prior_attempt,
     }
 
     # The attempt row is opened BEFORE the dispatch. An instant carrier

@@ -186,6 +186,12 @@ Keep **`call_status`** and **`processing_status`** separate: a successfully comp
   3. **Under our own per-minute cost guard**, or we cannot even test it — see §9.5.
   4. **Rings through to us**, verified as an INVITE in `livekit-sip` logs, *before* it goes into `ZVONOK_OWNED_CALLER_IDS`.
 
+- **Echo test: `4444`.** Zadarma answers it with a record-and-replay bot — free, always up, no human on the other end ([their FAQ](https://zadarma.com/en/support/faq/voip/how-to-check-call-quality/)). This is the correct first call after any change to trunk, codec, firewall or SIP config, and it is the only way to exercise the media path without spending money or someone's patience. `deploy/echotest.sh` places it.
+  - **Proves:** INVITE accepted on IP auth, alaw negotiated, RTP flowing *both* directions, our TTS actually leaving the box. One-way audio — the failure `use_external_ip` exists to prevent — presents as clean SIP logs and an empty transcript, and this catches it in 45 free seconds.
+  - **Proves nothing conversational.** The agent hears its own voice replayed and answers itself, so turn-taking, `answerer.py` and ASR accuracy all read as garbage. Judge the media path here; judge behaviour on a real call.
+  - Also gives a real round-trip number *through Zadarma's own media stack*, which §3's latency work does not — that measured the network to de1, not the carrier's path.
+  - `4444` is not E.164, so `policy.normalise_number` rejects it and it can never be reached through `POST /v1/calls`. Deliberate: a short-code exemption in the destination allowlist is precisely how a spend-capable actuator ends up dialling something billable (§6). The test takes the same call-api bypass as `call.sh`.
+  - ⚠ Untested as of 2026-08-04 whether Zadarma routes short codes from an **IP-auth trunk** specifically — their docs describe `4444` from a registered SIP account. One call settles it; if it does not route, this whole bullet is worth deleting rather than working around.
 - **Account hygiene:** check outbound channel limit (standard logins ≈ 3 concurrent), enable auto top-up or balance alerts, disable premium-rate destinations account-side if possible.
 
 ### 5.2 LiveKit stack (Docker on de1)
@@ -796,8 +802,8 @@ First real measurement (2026-07-27, 13 rows on our trunk): total **€0.0462**. 
 
 | Level | Wording | When |
 |---|---|---|
-| **`brief`** | *"Hello, this is an AI assistant, I'll note the answer down. <question>"* | One-question canvassing: ringing 15 pharmacies for a drug, shops for a part |
-| **`light`** (default) | *"This is Klava, an AI assistant calling for <owner>. I'll note down your answer so nothing gets lost."* | Ordinary information-gathering calls |
+| **`brief`** (default) | *"Hello, this is an AI assistant, I'll note the answer down. <question>"* | Ordinary information-gathering: ringing 15 pharmacies for a drug, shops for a part, asking about stock or hours |
+| **`light`** | *"This is Klava, an AI assistant calling for <owner>. I'll note down your answer so nothing gets lost."* | When naming the principal actually helps — a call the callee is expecting, or where "for whom" is the question |
 | **`full`** | *"… This call is transcribed and stored. If you would rather it were not, say so and I'll end the call."* | Two-party-consent jurisdictions; anything that books or commits on someone's behalf |
 
 **`brief` is a conversation mode, not just a shorter sentence.** The same knob — how much ceremony this call can afford — moves both, so it is one field rather than two. See §5.3.3 for what else it changes.
@@ -807,15 +813,31 @@ First real measurement (2026-07-27, 13 rows on our trunk): total **€0.0462**. 
 Two consequences follow, and both are load-bearing:
 
 - `disclosure_delivered()` drops its **name** requirement at this level. Leaving it in would have `disclosure_guard` conclude the disclosure never landed and cut across the callee to repeat a line they had already heard — the exact failure the guard exists to prevent.
-- `brief` is **never selected by the heuristic**, only by an explicit `disclosure_level`, *and* it is refused where the goal commits something. Shortening a disclosure must be a decision made by an agent that knows the call is a one-question canvass; the country table knows only where the call is going. And `policy.disclosure_level_for()` upgrades `brief` to `full` when the goal contains commitment words — nobody books, orders or cancels in someone's name behind the shortest disclosure we have. The asymmetry is deliberate: a caller may always ask for **more** disclosure than we would choose, never less than the goal warrants.
+- `brief` still carries **both** §8 facts. What it drops — the principal and the assistant's name — §8 never required. So `disclosure_delivered()` requires the retention verb at *every* level, separately from clause recall: see below.
+- `brief` is refused where the goal commits something. `policy.disclosure_level_for()` upgrades it to `full` on a commitment word — nobody books, orders or cancels in someone's name behind the shortest disclosure we have — and the two-party-consent countries still take `full` regardless. The asymmetry is deliberate: a caller may always ask for **more** disclosure than we would choose, never less than the goal warrants.
 
-Rationale for `light` being the default: "this call is recorded" is call-centre boilerplate that people hear as surveillance, and it frightens them into hanging up before the goal is reached. It is also **less accurate than it sounds** — we keep *text*, not audio (audio recording is off by default), so "I'll note down your answer" describes what actually happens and is what a human receptionist would say.
+**Why `brief` is the default, measured rather than argued.** It was `light`, escalating to `full` on any commitment word, on the theory that more disclosure is always safer. On 2026-08-04 a run of seven shop calls put that to the test: the goal said *"put them aside"*, which read as a booking, so every call opened with the `full` text. It takes **eleven seconds** to speak. Zadarma's CDR put the answered legs at **6, 7, 10, 13, 15 and 16 seconds** — every callee hung up during the introduction and not one of them ever heard the question. Two of the transcripts end mid-word inside the disclosure itself.
+
+Disclosure nobody stays on the line for is not disclosure; it is a recital that buys the callee nothing and loses the call. The long wording is now reached by **reaction, not prediction**: the agent opens short, and if the callee asks who is calling or objects to being noted down, it gives the fuller text *then* — to someone who asked, and will listen.
+
+Note also that "this call is recorded" is **less accurate than it sounds** — we keep *text*, not audio (audio recording is off by default), so "I'll note down your answer" describes what actually happens and is what a human receptionist would say.
 
 Selected per call via `disclosure_level` in the dispatch metadata, or by a **policy table keyed on destination country and task type**. Unknown values fall back to `light`.
 
-**Enforcement is not left to the model.** `disclosure_delivered()` requires an AI self-identification **and** a storage word in a **single uninterrupted turn**, plus — at `light` and `full` only — the assistant's name. A turn shredded by barge-in does not count, and neither does an introduction that names the AI but omits the retention. Failing that, `disclosure_guard` speaks the canonical text verbatim with `allow_interruptions=False`.
+**Both halves of §8 are required separately, and word-share alone will not do it.** `_spoke_clause` scores a clause by the share of its words that came back, which spreads the weight evenly over the greeting, the AI fact and the retention verb. `full` survives that because retention is a sentence of its own; `brief` is one sentence in every language, and `light`'s retention half is short. Measured against the real templates, dropping the storage verb alone still cleared the 0.75 threshold in **ru, pl and es** — *"Здравствуйте, это AI-ассистент, ответ."* counted as delivered. The callee was told a machine was calling and never told the answer is kept, and because the guard was satisfied it would never have made the agent say it again. English survived only by being wordier, which is luck, not design. So `prompts._RETENTION_STEMS` requires the retention fact as its own condition, at every level, with stem matching for the inflection (`запишу` / `записываю`, `zanotuję` / `zapisywana`).
+
+**Enforcement is not left to the model.** `disclosure_delivered()` checks the transcript against **the line we asked for**, clause by clause: every clause of `disclosure_for(language, level, introduce_as)` must land inside a **single uninterrupted turn** (75% word recall per clause, prefix-tolerant so a mangled ending still counts), plus — at `light` and `full` only — the assistant's name. Failing that, `disclosure_guard` speaks the canonical text verbatim with `allow_interruptions=False`.
 
 The `interrupted` check is the part that makes that claim true rather than merely documented: for a while the function described the requirement and never checked the flag, matching substrings on any assistant turn — so a shredded introduction still counted as delivered, which is precisely the phase-1 failure the guard exists to prevent. There is now a test for it (`test_policy.py`).
+
+**The clause is the unit, and that is the whole point** (reworked 2026-08-04, after independent Codex + Grok reviews of "why is language hardcoded at all?"). The check used to be two flat word lists — everything meaning "AI" and everything meaning "kept", in all four languages at once — and both reviewers landed on the same two silent holes in it:
+
+- **It could not tell `full` from `light`.** Both levels were checked with the same lists, so a `light` introduction — which never says the call is *stored* and never offers to stop — closed the guard on a call designated `full` precisely because it commits on someone's behalf.
+- **It was never scoped to the call's language.** At `brief`, where no name is required, a disclosure in any of the four languages satisfied a call in any other.
+
+Matching the known line fixes both and deletes the word lists along with the Klava/Klawa spelling hack (now ordinary w↔v normalisation). What it must **not** become is one similarity score over the whole sentence: the disclosure carries two separable facts, and dropping the retention clause costs a small share of the words but half of §8 — a single threshold loose enough for 8 kHz Polish would wave it through. Hence per-clause, and hence the deliberate bias: **a false negative is rude, a false positive is a §8 disclosure that never happened.**
+
+Two things the strict version has to keep allowing, both already documented above: a **stronger** disclosure than the level asked for (levels are tried from the requested one upward — `full` is a superset of `light`'s *meaning*, not of its wording), and the **mid-call language switch** of §8.2, where the agent re-introduces itself in the callee's language. The latter is why the check takes `also_languages`; a switched-language disclosure counts only as a *complete line* in that language, never as a stray word from it — which is the old hole, closed, without breaking the behaviour it accidentally permitted.
 
 
 #### 8.2 `declined` is evidence-gated, not model-asserted (learned 2026-07-27, phase-2 acceptance)

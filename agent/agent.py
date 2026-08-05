@@ -50,11 +50,19 @@ import report
 from answerer import is_noise_turn, looks_like_menu, looks_like_voicemail
 from prompts import (
     DISCLOSURE_LEVELS,
+    LANGUAGE_NAMES,
     PROBE,
     build_instructions,
     disclosure_delivered,
     disclosure_for,
 )
+
+# Every language this agent can speak. The prompt lets a speech-to-speech call
+# switch into any of them mid-call and re-introduce there (build_instructions,
+# "## Language"), and this deployment is speech-to-speech on every call — so the
+# §8 check has to be willing to find the disclosure in the language the callee
+# actually got it in, not only the one we dialled with.
+SPOKEN_LANGUAGES = tuple(LANGUAGE_NAMES)
 from timing import (
     DEFAULT_MAX_DURATION,
     END_OF_TURN_SILENCE_MS,
@@ -252,6 +260,7 @@ class ZvonokCaller(Agent):
         disclosure_level: str = "light",
         answer_schema: dict[str, Any] | None = None,
         introduce_as: str | None = None,
+        prior_attempt: str | None = None,
         turns: list[dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(
@@ -261,6 +270,7 @@ class ZvonokCaller(Agent):
                 disclosure_level=disclosure_level,
                 answer_schema=answer_schema,
                 introduce_as=introduce_as,
+                prior_attempt=prior_attempt,
             )
         )
         self.dial_info = dial_info
@@ -412,7 +422,13 @@ class ZvonokCaller(Agent):
         if (
             reason == "declined"
             and not self._decline_challenged
-            and not disclosure_delivered(self.turns, self.language, self.disclosure_level)
+            and not disclosure_delivered(
+                self.turns,
+                self.language,
+                self.disclosure_level,
+                self.introduce_as,
+                SPOKEN_LANGUAGES,
+            )
         ):
             self._decline_challenged = True
             logger.info("decline refused once — disclosure was never delivered")
@@ -522,6 +538,12 @@ async def entrypoint(ctx: JobContext) -> None:
     introduce_as = meta.get("introduce_as")
     if introduce_as is not None:
         introduce_as = str(introduce_as).strip()[:120] or None
+    # Written by call-api (policy.prior_attempt_note) when this number was rung
+    # recently and got nowhere. Absent on almost every call, and absent entirely
+    # from an older call-api — hence .get, not a required key.
+    prior_attempt = meta.get("prior_attempt")
+    if prior_attempt is not None:
+        prior_attempt = str(prior_attempt).strip()[:400] or None
     # Proper nouns to bias the recogniser towards — a drug name, a brand, a part
     # number. Bounded because they are passed straight to the ASR: xAI allows 100
     # terms of 50 characters, and we stay well inside that because a long list
@@ -561,6 +583,7 @@ async def entrypoint(ctx: JobContext) -> None:
         disclosure_level=disclosure_level,
         answer_schema=answer_schema,
         introduce_as=introduce_as,
+        prior_attempt=prior_attempt,
         turns=turns,
     )
 
@@ -693,6 +716,25 @@ async def entrypoint(ctx: JobContext) -> None:
     @ctx.room.on("participant_disconnected")
     def _on_disconnected(p: rtc.RemoteParticipant) -> None:
         if p.identity != number:
+            return
+        # ⚠ A disconnect is only a HANGUP if there was somebody there to hang up.
+        # This handler used to claim `callee_hangup` for any departure of the
+        # SIP participant, and a failed INVITE ends the same way — the leg is
+        # torn down and the participant leaves. It won the race by about two
+        # milliseconds, so the real reason arrived to find the disposition taken:
+        #
+        #   callee hung up
+        #   dial failed: INVITE failed: sip status: 480: Temporarily unavailable
+        #   termination already claimed as callee_hangup; ignoring no_answer
+        #
+        # A whole evening of calls to shops read back as "seven people hung up
+        # on us" when several had never rung at all, and the first diagnosis was
+        # built on that. A disposition that invents a human is worse than one
+        # that says nothing: it sends you looking at the prompt instead of the
+        # trunk. Leave it unclaimed and let the dial failure name itself.
+        if not answered_at:
+            logger.info("participant gone before answer — leaving disposition "
+                        "to whatever actually failed")
             return
         logger.info("callee hung up")
         if term.claim("callee_hangup"):
@@ -1041,6 +1083,12 @@ async def entrypoint(ctx: JobContext) -> None:
         four-words-only rule for call screeners (§5.3.1) is not violated: a
         screener produces one utterance and hands over, a person keeps talking.
         """
+
+        def delivered() -> bool:
+            return disclosure_delivered(
+                turns, language, disclosure_level, introduce_as, SPOKEN_LANGUAGES
+            )
+
         while not term.done.is_set():
             await asyncio.sleep(0.5)
             if term.disposition:  # call already ending
@@ -1049,11 +1097,15 @@ async def entrypoint(ctx: JobContext) -> None:
             agent_turns = sum(1 for t in turns if t["speaker"] == "assistant")
             if user_turns < 2 or agent_turns < 1:
                 continue
-            if disclosure_delivered(turns, language, disclosure_level):
+            if delivered():
                 return
             # Wait for our move so we don't cut across either party.
             if session.agent_state != "listening" or session.user_state == "speaking":
                 continue
+            # Forced in the language we dialled with even if the callee moved the
+            # call to another one: `delivered()` already accepted a disclosure in
+            # any of them, so reaching this line means none landed anywhere, and
+            # the dialling language is the only one we have evidence for.
             text = disclosure_for(language, disclosure_level, introduce_as)
             logger.warning("disclosure never completed — forcing it: %s", text)
             for attempt in (1, 2):
@@ -1073,7 +1125,7 @@ async def entrypoint(ctx: JobContext) -> None:
                 # the agent say it a second time.
                 for _ in range(12):  # up to ~6 s
                     await asyncio.sleep(0.5)
-                    if disclosure_delivered(turns, language, disclosure_level):
+                    if delivered():
                         logger.info("forced disclosure delivered (attempt %d)", attempt)
                         return
                 logger.warning("forced disclosure still not complete (attempt %d)", attempt)
@@ -1086,6 +1138,8 @@ async def entrypoint(ctx: JobContext) -> None:
 
 if __name__ == "__main__":
 
+    at_cap = False
+
     def concurrency_load(worker: Any) -> float:  # noqa: ANN401
         """Cap simultaneous paid calls (BRIEF §6).
 
@@ -1093,11 +1147,25 @@ if __name__ == "__main__":
         with how many phone lines we are paying for — this box would happily
         accept a dozen concurrent calls. Returning a value at or above
         load_threshold makes the worker stop accepting jobs.
+
+        Logged on the EDGE, not on the poll. LiveKit calls this about twice a
+        second, and the old unconditional warning turned a normal, healthy state
+        — five queued calls waiting for two lines — into six hundred identical
+        WARNING lines that buried the one ERROR explaining why a call failed.
+        Being at the cap is not an incident; arriving and leaving are the events
+        worth a line each.
         """
+        global at_cap
         active = len(getattr(worker, "active_jobs", ()))
         if active >= MAX_CONCURRENT_CALLS:
-            logger.warning("at concurrency cap (%d active) — refusing new jobs", active)
+            if not at_cap:
+                at_cap = True
+                logger.info("at concurrency cap (%d active) — queueing new jobs "
+                            "until a line frees", active)
             return 1.0
+        if at_cap:
+            at_cap = False
+            logger.info("below concurrency cap (%d active) — accepting jobs", active)
         return 0.0
 
     cli.run_app(

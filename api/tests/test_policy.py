@@ -372,8 +372,19 @@ def test_tenant_config() -> None:
 
 def test_disclosure() -> None:
     print("disclosure level")
-    expect("info call in ES is light", policy.disclosure_level_for("ES", "Ask about parking") == "light")
+    # The default is `brief`, and it was measured. Defaulting to `light` put an
+    # eleven-second recital in front of calls whose answered legs were 6-16
+    # seconds (Zadarma CDR, 2026-08-04): every callee hung up during the
+    # introduction and not one heard the question. `brief` still carries both §8
+    # facts; what it drops is the principal, which §8 does not require.
+    expect("a plain info call is brief",
+           policy.disclosure_level_for("ES", "Ask about parking") == "brief")
+    expect("a plain info call in FR is brief",
+           policy.disclosure_level_for("FR", "Ask if they have it in stock") == "brief")
+    # The two carve-outs that are not ours to trade away.
     expect("any call in DE is full", policy.disclosure_level_for("DE", "Ask about parking") == "full")
+    expect("any call in CH is full", policy.disclosure_level_for("CH", "Ask about parking") == "full")
+    expect("any call in PL is full", policy.disclosure_level_for("PL", "Ask about parking") == "full")
     expect("booking is full", policy.disclosure_level_for("ES", "Book a table for 2 at 20:00") == "full")
     expect("ru booking is full", policy.disclosure_level_for("ES", "Забронировать столик") == "full")
     expect("explicit override wins", policy.disclosure_level_for("DE", "Book a table", "light") == "light")
@@ -624,6 +635,121 @@ def test_disclosure_delivered() -> None:
                [{"speaker": "assistant", "text": pl_light.replace("Klawa", "Klava")}],
                "pl", "light"))
 
+    # --- the two facts are checked separately -------------------------------
+    #
+    # `full` says two things `light` does not — that the call is STORED, and that
+    # the callee may stop it. Dropping them costs a small share of the words and
+    # half of §8, so a whole-sentence similarity score would wave them through.
+    en_full = prompts.disclosure_for("en", "full")
+    en_light = prompts.disclosure_for("en", "light")
+    expect("full counts at full level",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": en_full}], "en", "full"))
+    expect("a light disclosure does NOT satisfy a call designated full",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": en_light}], "en", "full"))
+    expect("full without the storage clause does not count",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "This is Klava, an AI assistant calling on behalf of a "
+                         "potential client. If you would rather I did not, say "
+                         "so and I'll end the call."}], "en", "full"))
+    expect("full without the opt-out does not count",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "This is Klava, an AI assistant calling on behalf of a "
+                         "potential client. This call is transcribed and stored."}],
+               "en", "full"))
+    expect("a fuller disclosure than asked for still counts",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": en_full}], "en", "light"))
+
+    # --- the disclosure has to be in a language the call is actually in ------
+    #
+    # The old check looked for AI/storage words from all four languages at once,
+    # so at brief — where no name is required — a Polish line closed the guard on
+    # a Russian call. It only counts now if a COMPLETE line in that language
+    # landed, which is exactly what the prompt's mid-call language switch does.
+    ru_brief = prompts.disclosure_for("ru", "brief")
+    expect("a Polish disclosure does not satisfy a Russian call",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": pl_brief}], "ru", "brief"))
+    expect("a Russian disclosure satisfies a Russian call",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": ru_brief}], "ru", "brief"))
+    expect("a switched-language disclosure counts when switching is allowed",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": pl_brief}], "ru", "brief",
+               None, ("en", "ru", "es", "pl")))
+    expect("switching does not license a stray foreign word",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": "Zanotuję. Так, я AI-ассистент."}],
+               "ru", "brief", None, ("en", "ru", "es", "pl")))
+
+    # --- a custom principal is part of the line the guard forces ------------
+    custom_en = prompts.disclosure_for("en", "light", "a regular client")
+    expect("a custom introduce_as counts when the checker is told about it",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": custom_en}], "en", "light",
+               "a regular client"))
+
+    # --- ASR drift, in the safe direction -----------------------------------
+    #
+    # An 8 kHz line eats endings before it eats stems, and it eats a word here
+    # and there. One mangled word must not send the guard across the callee to
+    # repeat a disclosure they plainly heard; a missing clause must.
+    drifted = ("Dzień dobry, tu Klava, asystent AI dzwoniacy w imieniu "
+               "potencjalnego klienta. Zanotuje odpowiedz, zeby nic nie umknelo.")
+    expect("a disclosure transcribed without diacritics still counts",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant", "text": drifted}], "pl", "light"))
+    expect("a disclosure missing its second half does not",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Dzień dobry, tu Klawa, asystent AI dzwoniący w "
+                         "imieniu potencjalnego klienta."}], "pl", "light"))
+
+    # The retention fact, on its own, at every level and in every language.
+    #
+    # These are regression tests for a measured false positive, not hypotheticals.
+    # `brief` is one sentence, so retention is not its own clause, and word-share
+    # recall let the storage verb vanish while the line still scored 5 of 6:
+    # ru, pl and es all counted a disclosure that told the callee a machine was
+    # calling and never told them their answer is kept. That is the half of §8
+    # the guard exists to force, and it would never have re-said it.
+    dropped = {
+        "en": "Hello, this is an AI assistant, the answer.",
+        "ru": "Здравствуйте, это AI-ассистент, ответ.",
+        "es": "Hola, soy un asistente de IA, la respuesta.",
+        "pl": "Dzień dobry, tu asystent AI, odpowiedź.",
+    }
+    for lang, said in dropped.items():
+        expect(f"{lang} brief without the storage verb does not count",
+               not prompts.disclosure_delivered(
+                   [{"speaker": "assistant", "text": said}], lang, "brief"))
+
+    # Same fact, same hole, one rung up: light's retention half is short too.
+    light_dropped = {
+        "ru": "Это Клава, AI-ассистент потенциального клиента. "
+              "Ответ, чтобы ничего не упустить.",
+        "es": "Soy Klava, un asistente de IA que llama de parte de un cliente "
+              "potencial. Su respuesta para no perder nada.",
+        "pl": "Dzień dobry, tu Klawa, asystent AI dzwoniący w imieniu "
+              "potencjalnego klienta. Odpowiedź, żeby nic nie umknęło.",
+    }
+    for lang, said in light_dropped.items():
+        expect(f"{lang} light without the storage verb does not count",
+               not prompts.disclosure_delivered(
+                   [{"speaker": "assistant", "text": said}], lang, "light"))
+
+    # And the fix must not have bought that by rejecting inflections: the verb
+    # comes back off an 8 kHz line in whatever form the speaker used.
+    expect("an inflected storage verb still counts",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Здравствуйте, это AI-ассистент, записываю ответ."}],
+               "ru", "brief"))
+
     # The canvass prompt is a separate template, not the long one with sections
     # switched off — and every word of it is paid for on a cold first turn.
     canvass = prompts.build_instructions("Ask if they stock X.", "pl",
@@ -674,10 +800,45 @@ def test_answerer() -> None:
            not answerer.looks_like_menu("she sounded depressed"))
 
 
+def test_prior_attempt() -> None:
+    print("prior attempt note")
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 8, 4, 18, 10, tzinfo=timezone.utc)
+
+    def row(minutes: int, achieved: bool = False, job_id: str = "c_old"):
+        return {"id": job_id,
+                "created_at": now - timedelta(minutes=minutes),
+                "goal_achieved": achieved}
+
+    expect("no history means no line", policy.prior_attempt_note([], now) is None)
+    recent = policy.prior_attempt_note([row(8)], now)
+    expect("a recent failed call is mentioned", recent is not None)
+    expect("it says how long ago", "8 minutes" in (recent or ""))
+    expect("one minute is singular",
+           "1 minute " in (policy.prior_attempt_note([row(1)], now) or ""))
+    # A call that got its answer has no business ringing again, and apologising
+    # for one that went fine invites "yes, and I already told you".
+    expect("a successful call is not apologised for",
+           policy.prior_attempt_note([row(8, achieved=True)], now) is None)
+    # Beyond the window nobody remembers the call, and the reminder is worse
+    # than silence.
+    expect("an old call is past remembering",
+           policy.prior_attempt_note([row(300)], now) is None)
+    # The job being dispatched is itself in the table by the time this runs.
+    expect("the call being placed is not its own prior attempt",
+           policy.prior_attempt_note([row(0, job_id="me")], now,
+                                     exclude_job_id="me") is None)
+    # Clock skew between the API box and Postgres must not produce "about
+    # -3 minutes ago".
+    expect("a future timestamp is ignored",
+           policy.prior_attempt_note([row(-3)], now) is None)
+
+
 if __name__ == "__main__":
     for test in (
         test_destinations, test_caller_id, test_tenant_isolation, test_tenant_config,
-        test_disclosure, test_tokens,
+        test_disclosure, test_tokens, test_prior_attempt,
         test_cost, test_state_normalisation, test_extractor_helpers,
         test_mcp_idempotency, test_disclosure_delivered, test_answerer,
     ):

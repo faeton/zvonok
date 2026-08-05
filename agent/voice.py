@@ -73,6 +73,16 @@ def transcription_options(
     that looked like confirmation. Auto-detect stayed on for every call and the
     drug names never reached the recogniser.
 
+    What the hint is NOT: a measured fix. Once the field names were right,
+    `tools/asr_probe.py` ran twenty controlled arms (BRIEF §10) and hint on, hint
+    off and a deliberately WRONG hint all returned the same transcript. That does
+    not mean xAI ignores it — a hint is a soft prior and decisive acoustics
+    should out-argue it — but it does mean the Polish failure above has no
+    demonstrated cause, and this line is not it. It stays because it costs
+    nothing and is the right kind of control. The half still worth testing is
+    `keyterms`, which is closer to binary: a rare proper noun comes back or does
+    not.
+
     The lesson worth keeping: an echo is not an acknowledgement. This provider
     speaks the OpenAI realtime PROTOCOL, which is not the same as accepting the
     OpenAI realtime SCHEMA, and the SDK's type will happily carry either because
@@ -82,7 +92,7 @@ def transcription_options(
     server to `conversation.item.input_audio_transcription.updated`, which the
     xAI plugin does not handle — it only handles `.completed` (distinguishing
     partials by a `status` field). We would lose every user transcript, which is
-    a worse failure than the one this function fixes.
+    a worse failure than the ones this function guards against.
     """
     return AudioTranscription(
         # BCP-47. Our language codes are already valid BCP-47 primary subtags.

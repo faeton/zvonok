@@ -14,6 +14,8 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # E.164
@@ -28,6 +30,11 @@ def normalise_number(raw: str) -> str:
     The 8-digit minimum is not cosmetic: it is what keeps emergency and short
     service codes (112, 999, 911, 118xx) from ever reaching the dialler, since
     none of them can be expressed as a valid international number.
+
+    This also rejects Zadarma's echo test (4444), and that stays rejected: the
+    test is worth having (BRIEF §5.1, deploy/echotest.sh) but not worth a
+    short-code exemption here, which is how a spend-capable actuator ends up
+    dialling something billable. The echo test bypasses call-api entirely.
     """
     cleaned = re.sub(r"[\s\-().]", "", raw or "")
     if not cleaned.startswith("+") and cleaned.startswith("00"):
@@ -260,6 +267,54 @@ def estimate_usd(
 
 
 # ---------------------------------------------------------------------------
+# "We have called you already"
+# ---------------------------------------------------------------------------
+
+# How far back a previous attempt is still worth mentioning. Beyond this the
+# person will not remember it, and reminding them is worse than not.
+PRIOR_ATTEMPT_WINDOW_SECONDS = 2 * 60 * 60
+
+
+def prior_attempt_note(
+    rows: list[dict[str, Any]], now: datetime, exclude_job_id: str | None = None
+) -> str | None:
+    """One line for the agent about the last call to this number that got nowhere.
+
+    ⚠ WHY: on 2026-08-04 one shop was dialled three times inside eight minutes
+    and every call opened as if it were the first. From their side that is not a
+    retry, it is a machine that will not stop. A person who rang back would say
+    "sorry, I called a moment ago and we got cut off" — it costs two seconds and
+    it is the difference between a second chance and a blocked number.
+
+    Only unsuccessful attempts count. A call that got its answer has no reason to
+    ring again, and if something does dial it anyway, apologising for a call that
+    went fine only invites "yes, and I already told you".
+
+    Returns None when there is nothing worth saying, which is the common case —
+    the caller must not paste an empty string into the prompt.
+    """
+    for row in rows:
+        if exclude_job_id and row.get("id") == exclude_job_id:
+            continue
+        if row.get("goal_achieved"):
+            return None  # the most recent call worked; nothing to apologise for
+        created = row.get("created_at")
+        if not created:
+            continue
+        age = (now - created).total_seconds()
+        if age < 0 or age > PRIOR_ATTEMPT_WINDOW_SECONDS:
+            return None  # too long ago to be a shared memory
+        minutes = max(1, round(age / 60))
+        return (
+            f"You already called this number about {minutes} minute"
+            f"{'s' if minutes != 1 else ''} ago and the call ended without an "
+            f"answer. Open by saying so — that you rang a moment ago and were "
+            f"cut off — then ask your question. Do not pretend it is a first call."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Disclosure level (BRIEF §8.1)
 # ---------------------------------------------------------------------------
 
@@ -303,9 +358,30 @@ def disclosure_level_for(
 ) -> str:
     """Pick the disclosure register. An explicit request wins — except upward.
 
-    "brief" is only ever reachable by explicit request (see CallRequest), and it
-    is the one level that is genuinely LESS than §8's baseline: it drops the
-    principal entirely, leaving only "I am an AI" and "your answer is kept".
+    ⚠ THE DEFAULT IS `brief`, AND IT WAS MEASURED, NOT CHOSEN. An earlier version
+    defaulted to `light` and escalated to `full` on any commitment word, on the
+    theory that more disclosure is always safer. Seven shop calls on 2026-08-04
+    showed what that costs: the goal said "put them aside", which read as a
+    booking, so every call opened with the `full` text. It takes ELEVEN SECONDS
+    to speak. Zadarma's CDR put the answered legs at 6, 7, 10, 13, 15 and 16
+    seconds — the callees hung up during the introduction, and not one of them
+    ever heard the question. Disclosure nobody stays on the line for is not
+    disclosure; it is a recital that buys the callee nothing and loses the call.
+    `brief` carries BOTH §8 facts — "I am an AI" and "your answer is kept" — in
+    one sentence of about four seconds. What it drops is the principal and the
+    assistant's name, neither of which §8 requires.
+
+    Escalation is by REACTION, not by prediction: the agent opens short, and if
+    the callee asks who is calling or objects to being recorded, the prompt tells
+    it to give the fuller text then. That is where the long wording actually gets
+    listened to.
+
+    Two things still force `full` up front, because they are not ours to trade:
+    a two-party-consent jurisdiction, and a goal that commits something in
+    someone's name. Nobody books a table behind a four-second disclosure.
+
+    "brief" is the one level that is genuinely LESS than §8's baseline: it drops
+    the principal entirely, leaving only "I am an AI" and "your answer is kept".
 
     That makes an unguarded override a real hole rather than a theoretical one:
     a playbook file could set `"disclosure_level": "brief"` and quietly canvass
@@ -331,7 +407,10 @@ def disclosure_level_for(
         return "full"
     if commits:
         return "full"
-    return "light"
+    # Was "light". See the ⚠ above: `light` names a principal the callee has
+    # never heard of and did not ask about, and the seconds that costs are the
+    # seconds the call does not survive.
+    return "brief"
 
 
 # ---------------------------------------------------------------------------
