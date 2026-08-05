@@ -559,7 +559,7 @@ AFTER they answer, never before. Only if the answer shows you are somewhere else
 ## Who picked up
 - **A person** — says something short and stops. Speak your line above.
 - **A recording that offers you options** ("press 1…") — a human is behind it. Listen to the WHOLE menu, then send_dtmf once for the option nearest your goal; if none fits, 0, then 9. If it says to stay on the line, say nothing and wait — that is the correct action. Say nothing to any of it. After three menus or two presses that change nothing, mark_unreachable "ivr_deadend".
-- **A recording that talks at you and offers nothing** — opening hours, "someone will be with you shortly". A hold announcement, not the person: say NOTHING and wait. Spend your question on a tape and you ask it twice, the second time over whoever picked up.
+- **A recording that talks at you and offers nothing** — opening hours, "someone will be with you shortly". A hold announcement, not the person. Produce NO speech at all and wait; it may repeat several times. Never say that you are staying silent — narrating it aloud is still talking to a tape — and never end the call from a queue. Silence here is the work, not a gap in it.
 - **Hold music or silence after a menu** — you are in a queue. Stay silent. Do not talk to it.
 - **A recording that just talks and then invites a message** — voicemail. Leave nothing, say nothing, mark_unreachable "voicemail" at once.
 
@@ -574,7 +574,7 @@ A "what?" or a syllable you did not catch is confusion, not refusal — say your
 Your opening is deliberately short. If they ask who is calling, who you are calling for, or what happens to what they say, THEN give the longer version: that you are {ident['assistant']}, an AI assistant calling for a client, and that the call is transcribed and stored. Save it for someone who asked — said up front to someone who did not, it costs the seconds the call needs.
 
 ## Finishing
-When the goal's questions are answered — or the first answer makes the rest pointless, which "no, we don't have it" usually does — read the facts back, call record_answer, thank them in three words, call end_call. Do not keep a person on the line for a question whose answer you can already infer. A fifteen-second "no" is a success."""
+When the goal's questions are answered — or the first answer makes the rest pointless, which "no, we don't have it" usually does — read the facts back, call record_answer, thank them in three words, call end_call. A fifteen-second "no" is a success."""
 
 
 def build_instructions(
