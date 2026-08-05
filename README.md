@@ -44,7 +44,7 @@ This tool spends real money and rings real strangers, so the guardrails are stru
 2. A Zadarma account (or any SIP trunk with IP-auth and G.711 alaw) with a DID or two.
 3. An xAI API key (voice brain + extraction model).
 4. Tailscale (call-api binds to the tailnet address only — no public API surface).
-5. `cp deploy/.env.example deploy/.env`, fill it in, `./deploy.sh`, create the trunk, place a test call to yourself.
+5. `cp deploy/.env.example deploy/.env`, fill it in, `./deploy.sh`, create the trunk, then `deploy/echotest.sh` (Zadarma's free echo test — proves the media path with no human involved) before placing a real test call to yourself.
 
 ## Operating it
 

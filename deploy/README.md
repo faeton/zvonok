@@ -12,6 +12,7 @@ Runs on **de1 only** (BRIEF §3). Deployed at `~/zvonok`; secrets live in `deplo
 | `firewall.sh` | opens 5060 + RTP to Zadarma's `185.45.152.0/22` only |
 | `lkctl.py` / `lkctl.sh` | trunk creation + call dispatch via the livekit-api SDK |
 | `call.sh` | thin wrapper: place one test call, bypassing call-api |
+| `echotest.sh` | call Zadarma's echo test (`4444`) — free media-path smoke test, no human involved |
 
 Everything is on **host networking**, so each service binds narrowly itself rather than relying on docker port mapping: redis and postgres on `127.0.0.1`, livekit-server on `127.0.0.1:7880`, call-api on the **tailnet address only**.
 
@@ -53,6 +54,22 @@ Or bypassing it entirely, for debugging the media path (no caps, no record, no e
 docker compose logs -f agent
 ls -t transcripts/ | head -1
 ```
+
+## Smoke-testing without calling a human
+
+Zadarma answers **`4444`** with an echo test: it greets, records, and plays your audio back. Free, always up, and the right first call after any change to the trunk, codec, firewall or SIP config.
+
+```bash
+./echotest.sh          # 45s by default; ./echotest.sh 60 for longer
+```
+
+It proves the boring layer — INVITE accepted on IP auth, alaw negotiated, RTP flowing **both** ways, agent speech actually leaving the box. Read the transcript: agent line *and* echo = both directions alive; agent line but no echo = inbound RTP dead (check `use_external_ip`); neither = start with the SIP logs.
+
+It proves nothing conversational. The agent hears itself played back and will answer itself, so turn-taking, answerer detection and ASR accuracy all read as garbage from an echo test. That is the tool working as designed, not a regression — judge behaviour from a real call.
+
+`4444` is not E.164, so `POST /v1/calls` rejects it at `policy.normalise_number`, deliberately: a short-code exemption in the destination allowlist is how a spend-capable actuator later dials something billable. `echotest.sh` takes the same bypass as `call.sh`.
+
+## Caller ID
 
 Caller ID is chosen per destination country and is a **cost** lever: EU/UK destinations cost ×20–34 less with a UK caller ID than a UA one (BRIEF §9). `call.sh` defaults to the UK DID; call-api picks it from the country.
 
