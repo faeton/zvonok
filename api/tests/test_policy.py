@@ -854,6 +854,38 @@ def test_disclosure_delivered() -> None:
     expect("the canvass prompt still requires admitting to being an AI",
            "are an AI, say yes" in canvass)
 
+    # ⚠ Each of the next five was bought with a real call that died. The canvass
+    # template is trimmed for length every time something is added to it, and
+    # these are the sentences most likely to go — they read like commentary and
+    # are not. Pinned as text, deliberately: a prompt rule nobody asserts is a
+    # prompt rule that survives exactly until the next word count.
+    en_canvass = prompts.build_instructions("Ask if they stock X.", "en",
+                                            disclosure_level="brief")
+    for rule, why in (
+        ("SHORTEST FORM FIRST",
+         "a 25-word first question was hung up on mid-sentence"),
+        ("NOTHING goes in front of the question",
+         "an apology and an identity check pushed the question past the hangup"),
+        ("Produce NO speech at all",
+         "the model said 'Say nothing — this is a hold announcement' out loud"),
+        ("never end the call from a queue",
+         "it hung up on a queue it had been told to wait in"),
+        ("ask once who you reached and believe them",
+         "a franchise name read as a wrong number"),
+    ):
+        expect(f"canvass keeps the rule that {why}", rule in en_canvass)
+
+    # The prior-attempt block renders only when there IS one, and never tells
+    # the agent to lead with it.
+    with_prior = prompts.build_instructions(
+        "Ask if they stock X.", "en", disclosure_level="brief",
+        prior_attempt="You already called this number about 8 minutes ago. "
+                      "Do NOT open with that.")
+    expect("a prior attempt gets its own section",
+           "rung them already" in with_prior)
+    expect("...and no section at all without one",
+           "rung them already" not in en_canvass)
+
 
 def test_answerer() -> None:
     """Who picked up, judged from what was said (agent/answerer.py)."""
