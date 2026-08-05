@@ -387,7 +387,16 @@ def test_disclosure() -> None:
     expect("any call in PL is full", policy.disclosure_level_for("PL", "Ask about parking") == "full")
     expect("booking is full", policy.disclosure_level_for("ES", "Book a table for 2 at 20:00") == "full")
     expect("ru booking is full", policy.disclosure_level_for("ES", "Забронировать столик") == "full")
-    expect("explicit override wins", policy.disclosure_level_for("DE", "Book a table", "light") == "light")
+    # ⚠ This test used to assert the opposite — that an explicit "light" won
+    # here — and in doing so it blessed the hole: a booking, in a two-party
+    # consent country, behind the shorter wording. Only "brief" was being
+    # upgraded on a commitment, because "brief" is the conspicuous level.
+    expect("a commitment outranks an explicit light",
+           policy.disclosure_level_for("DE", "Book a table", "light") == "full")
+    expect("a commitment outranks an explicit brief",
+           policy.disclosure_level_for("ES", "Book a table", "brief") == "full")
+    expect("an explicit override still wins on a plain question",
+           policy.disclosure_level_for("DE", "Ask about parking", "light") == "light")
     # `brief` drops the principal entirely, so it is the one override that must
     # not be able to go under the floor. A playbook file asking for brief on a
     # booking would otherwise commit something in someone's name behind the
@@ -756,6 +765,37 @@ def test_disclosure_delivered() -> None:
     # English noun "store" — and the canvass question we ask is literally "do
     # you have Royal Pop in the store right now". The guard proving we said the
     # answer is kept was being passed by the question.
+    # Prefix matching was tried twice and was wrong twice, in both directions at
+    # once. These four pin the outcome of that: two words that merely BEGIN like
+    # a retention verb must not count, and two real inflections that diverge
+    # early must.
+    expect("'noteworthy' is not 'note'",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Hello, this is an AI assistant. The answer is "
+                         "noteworthy."}], "en", "brief"))
+    expect("'guardería' is not 'guardar'",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Hola, soy un asistente de IA, la respuesta sobre la "
+                         "guardería."}], "es", "brief"))
+    expect("'anotamos' counts as anotar",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Hola, soy un asistente de IA, anotamos la respuesta."}],
+               "es", "brief"))
+    expect("'zanotowano' counts as zanotować",
+           prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Dzień dobry, tu asystent AI, zanotowano odpowiedź."}],
+               "pl", "brief"))
+    # "do you keep it in stock" must not be able to stand in for "I'll keep it".
+    expect("'keep' in the question is not a retention promise",
+           not prompts.disclosure_delivered(
+               [{"speaker": "assistant",
+                 "text": "Hello, this is an AI assistant, the answer. Do you "
+                         "keep Royal Pop in stock?"}], "en", "brief"))
+
     expect("the noun 'store' does not stand in for 'stored'",
            not prompts.disclosure_delivered(
                [{"speaker": "assistant",

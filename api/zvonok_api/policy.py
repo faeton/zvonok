@@ -422,7 +422,13 @@ def disclosure_level_for(
     low = (goal or "").lower()
     commits = any(w in low for w in _COMMITMENT_WORDS)
 
-    if override == "brief" and commits:
+    # ⚠ ANY override below `full`, not just `brief`. This read `override ==
+    # "brief"` and let an explicit `light` walk a booking straight through:
+    # disclosure_level_for("DE", "Book a table", "light") returned "light" —
+    # a commitment made in someone's name, in a two-party-consent country,
+    # behind the shorter wording, with a test blessing it. `brief` was guarded
+    # because it is the conspicuous one; the hole was the level nobody looked at.
+    if commits and override in ("brief", "light"):
         return "full"
     if override in ("brief", "light", "full"):
         return override

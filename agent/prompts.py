@@ -266,47 +266,75 @@ def _spoke_clause(clause: list[str], said: list[str]) -> bool:
 # design. So the fact gets its own requirement: whatever else matched, at least
 # one of these stems has to have been heard in that same turn.
 #
-# Stems, not words, because `_heard` prefix-matches and every language here
-# inflects the verb ("запишу" / "записываю", "zanotuję" / "zapisywana").
-_RETENTION_STEMS = {
-    "en": ("note", "noting", "transcrib", "stored", "storing", "record"),
-    "ru": ("запиш", "записыва", "транскрибир", "сохран", "храни"),
-    "es": ("anotar", "anoto", "transcrib", "guard"),
-    "pl": ("zanotuj", "notuj", "zapis", "transkryb"),
+# WHOLE FORMS, enumerated. Not stems, and deliberately not prefixes.
+#
+# ⚠ TWO REVIEWS AND TWO WRONG ANSWERS GOT US HERE, so do not "simplify" this
+# back into prefix matching. The first version reused `_heard`, which matches
+# prefixes BOTH ways, so the stem "stored" was satisfied by the English noun
+# "store" — and our own canvass question is "do you have Royal Pop in the STORE
+# right now". Restricting it to one direction was necessary and still not
+# enough: "noteworthy" really does begin with "note", and Spanish "guardería"
+# really does begin with "guard". Both were reproduced against these templates:
+#
+#   "Hello, this is an AI assistant. The answer is noteworthy."
+#   "Hola, soy un asistente de IA, la respuesta sobre la guardería."
+#
+# Neither says the answer is kept; both counted. The same prefix rule ALSO
+# rejected legitimate inflections that diverge early — "anotamos", "zanotowano"
+# — so it was lenient exactly where it should have been strict and strict where
+# it should have been lenient. A prefix is not a morpheme.
+#
+# So the acceptable forms are written out. The cost is that an inflection nobody
+# listed reads as "not said" and the guard re-says the line, which is the
+# direction this module is supposed to fail in: an unnecessary repeat annoys
+# someone, a missed disclosure records them without telling them.
+_RETENTION_FORMS = {
+    # ⚠ "store", "stores" and "keep" are DELIBERATELY ABSENT although they are
+    # perfectly good retention verbs in English. They are also the words our own
+    # questions are made of — "do you have it in the store", "do you keep it in
+    # stock" — and a retention check satisfied by the question it accompanies is
+    # no check at all. Losing them costs a re-say on the rare turn that uses
+    # only those words; keeping them cost the whole guarantee.
+    "en": frozenset({
+        "note", "noted", "notes", "noting", "jot", "jotted",
+        "transcribe", "transcribed", "transcribes", "transcribing",
+        "stored", "storing", "saved", "saves", "saving",
+        "record", "recorded", "recording", "kept",
+    }),
+    "ru": frozenset({
+        "запишу", "запишем", "запиши", "записываю", "записываем", "записать",
+        "записано", "записывается", "запись", "транскрибируется",
+        "транскрибируем", "сохраняется", "сохраню", "сохраняем", "сохранено",
+        "храню", "храним", "хранится", "фиксирую",
+    }),
+    "es": frozenset({
+        # `_fold` strips the accents, so these are the folded spellings.
+        "anotare", "anoto", "anotamos", "anotar", "anotada", "anotado",
+        "apunto", "apuntare", "transcribe", "transcribira", "transcrita",
+        "guarda", "guardara", "guardo", "guardamos", "guardada", "registra",
+    }),
+    "pl": frozenset({
+        # `_fold` also folds w→v, so every form here is written as it will be
+        # AFTER folding — "zapisywana" becomes "zapisyvana".
+        "zanotuje", "zanotujemy", "zanotovano", "zanotovane", "notuje",
+        "zapisze", "zapiszemy", "zapisyvana", "zapisyvane", "zapisuje",
+        "zapisano", "transkrybovana", "transkrybuje", "przechovyvana",
+    }),
 }
-
-
-def _grew_from(stem: str, said: list[str]) -> bool:
-    """Did a spoken word GROW from this stem? One direction only.
-
-    ⚠ NOT `_heard`. That one prefix-matches both ways, which is right for
-    matching a template word against a mangled transcript and catastrophically
-    wrong here. `_heard("stored", ["store"])` is True, because "stored" starts
-    with "store" — so the retention stem `stored` was satisfied by the ordinary
-    English noun, and our own canvass question is "do you have Royal Pop in the
-    STORE right now". The check that exists to prove we said the answer is kept
-    was being passed by the word "store" in the question:
-
-        "Hello, this is an AI assistant, I'll the answer down.
-         Do you have Royal Pop in the store?"        → counted as delivered
-
-    A stem is a beginning. Inflection only ever adds to the end — "запишу",
-    "записywana", "anotaré" — so the SAID word must start with the STEM, never
-    the reverse. Reversing it lets any shorter unrelated word stand in for a
-    longer stem, which is exactly the false positive this whole section exists
-    to prevent.
-    """
-    return any(s.startswith(stem) for s in said)
 
 
 def _kept_the_retention_fact(language: str, said: list[str]) -> bool:
     """Did this turn actually say the answer is kept?
 
+    Whole-word membership, no prefix matching in either direction — see
+    _RETENTION_FORMS for the two false positives and two false negatives that
+    prefix matching produced against these very templates.
+
     Falls back to English rather than to "yes": an unknown language must not buy
     a pass on the half of §8 that is about retention.
     """
-    stems = _RETENTION_STEMS.get(language, _RETENTION_STEMS["en"])
-    return any(_grew_from(s, said) for stem in stems for s in _fold(stem))
+    forms = _RETENTION_FORMS.get(language, _RETENTION_FORMS["en"])
+    return any(word in forms for word in said)
 
 
 def disclosure_delivered(
@@ -519,12 +547,12 @@ The moment a HUMAN speaks, say this and only this, in one breath:
 This first turn is fixed. Whatever you think you heard, you say this. Do not react to their greeting, do not comment on it, and never answer it. The ONE thing that changes it is a "You have rung them already" section above: if there is one, its sentence goes in front of this line, and the rest still follows word for word.
 
 ## What you never do
-You are not a helpline. Never explain, advise, instruct, or answer a question of theirs. On an 8 kHz line you will sometimes hear a fluent sentence nobody said — often in another language, often a question. The tell is that it does not fit: a business does not answer its own phone by asking YOU for advice. When it does not fit, you misheard, so ask your question again instead of replying to it.
+You are not a helpline. Never explain, advise, instruct, or answer a question of theirs — one exception: a question ABOUT YOU (who is calling, are you a machine, what happens to what I say) is always answered, honestly, at once. On an 8 kHz line you will sometimes hear a fluent sentence nobody said — often in another language, often a question. The tell is that it does not fit: a business does not answer its own phone by asking YOU for advice. When it does not fit, you misheard, so ask your question again instead of replying to it.
 
 No small talk, no offering help, no apologising for calling, no asking the same thing twice in different words. (The one exception is the "You have rung them already" section, if there is one — there, saying so IS the job.) Do not give your name unless asked (it is {ident['assistant']}).
 
 ## Are they even the right place
-If the goal names the business you were told to call, and whoever answers names a plainly different one, you have the wrong number: say sorry, you were calling <business>, then mark_unreachable "wrong_number". Do not ask your question anyway. An 8 kHz line mangles business names, so a name you merely did not catch is not a mismatch — if you are unsure, ask once whether you have reached them, and believe their answer.
+If they name a different business from the one in your goal, ASK ONCE — say who you were trying to reach, and believe the answer. Only a clear "no" is a wrong number: say sorry, mark_unreachable "wrong_number". Never skip the question. This line mangles names, and a shop may answer as a department, a franchise or the parent brand — none of which is the wrong shop.
 
 ## Who picked up
 - **A person** — says something short and stops. Speak your line above.
