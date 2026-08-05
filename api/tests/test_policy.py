@@ -397,6 +397,21 @@ def test_disclosure() -> None:
            policy.disclosure_level_for("ES", "Book a table", "brief") == "full")
     expect("an explicit override still wins on a plain question",
            policy.disclosure_level_for("DE", "Ask about parking", "light") == "light")
+    # Recording outranks everything, including an explicit request for less.
+    # Every other level's wording says we keep text; that is only true while the
+    # audio is not kept, and a callee cannot consent to a recording nobody named.
+    expect("recording forces the recorded level",
+           policy.disclosure_level_for("ES", "Ask about parking",
+                                       record_audio=True) == "recorded")
+    expect("recording is not talked down by an explicit brief",
+           policy.disclosure_level_for("ES", "Ask about parking", "brief",
+                                       record_audio=True) == "recorded")
+    expect("recording is not talked down by an explicit full",
+           policy.disclosure_level_for("PL", "Book a table", "full",
+                                       record_audio=True) == "recorded")
+    expect("no recording, no change",
+           policy.disclosure_level_for("ES", "Ask about parking",
+                                       record_audio=False) == "brief")
     # ⚠ Measured, not hypothetical. This exact goal wording took a Valencia call
     # to `full` on 2026-08-05: "order" matched as a substring of "in this
     # order", the callee got the eleven-second recital and hung up at 17s

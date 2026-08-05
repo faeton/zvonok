@@ -142,12 +142,28 @@ DISCLOSURE_FULL = {
     "es": "Soy {assistant}, un asistente de IA que llama de parte de {on_behalf}. Esta llamada se transcribe y se guarda. Si prefiere que no, dígamelo y finalizaré la llamada.",
     "pl": "Dzień dobry, tu {assistant}, asystent AI dzwoniący w imieniu {on_behalf}. Rozmowa jest transkrybowana i zapisywana. Jeśli sobie Państwo tego nie życzą, proszę powiedzieć, a zakończę rozmowę.",
 }
-DISCLOSURE_LEVELS = ("brief", "light", "full")
+# The one level that is not about jurisdiction or commitment but about a FACT
+# THAT CHANGED. Every other level promises we keep text — "I'll note the answer
+# down" — and that is true because audio recording is off. Turn it on for a call
+# and the sentence becomes a lie, so this wording replaces it and says the word
+# people actually care about. call-api forces this level whenever `record_audio`
+# is set; it is not selectable on its own and not refusable.
+DISCLOSURE_RECORDED = {
+    "en": "This is {assistant}, an AI assistant calling on behalf of {on_behalf}. This call is being recorded and stored. If you would rather it were not, say so and I'll end the call.",
+    "ru": "Это {assistant}, AI-ассистент, звоню по поручению {on_behalf}. Разговор записывается и сохраняется. Если вы против — скажите, и я завершу звонок.",
+    "es": "Soy {assistant}, un asistente de IA que llama de parte de {on_behalf}. Esta llamada se graba y se guarda. Si prefiere que no, dígamelo y finalizaré la llamada.",
+    "pl": "Dzień dobry, tu {assistant}, asystent AI dzwoniący w imieniu {on_behalf}. Rozmowa jest nagrywana i zapisywana. Jeśli sobie Państwo tego nie życzą, proszę powiedzieć, a zakończę rozmowę.",
+}
+
+# Ordered weakest to strongest. `disclosure_delivered` walks from the requested
+# level upwards, so a stronger line always satisfies a weaker requirement.
+DISCLOSURE_LEVELS = ("brief", "light", "full", "recorded")
 
 _DISCLOSURE_TABLES = {
     "brief": DISCLOSURE_BRIEF,
     "light": DISCLOSURE_LIGHT,
     "full": DISCLOSURE_FULL,
+    "recorded": DISCLOSURE_RECORDED,
 }
 
 # The probe, also fixed text. Asked for "one or two words like Hello?", the model
@@ -312,6 +328,7 @@ _RETENTION_FORMS = {
         "anotare", "anoto", "anotamos", "anotar", "anotada", "anotado",
         "apunto", "apuntare", "transcribe", "transcribira", "transcrita",
         "guarda", "guardara", "guardo", "guardamos", "guardada", "registra",
+        "graba", "grabada", "grabara", "grabando", "grabacion",
     }),
     "pl": frozenset({
         # `_fold` also folds w→v, so every form here is written as it will be
@@ -319,8 +336,35 @@ _RETENTION_FORMS = {
         "zanotuje", "zanotujemy", "zanotovano", "zanotovane", "notuje",
         "zapisze", "zapiszemy", "zapisyvana", "zapisyvane", "zapisuje",
         "zapisano", "transkrybovana", "transkrybuje", "przechovyvana",
+        "nagryvana", "nagrana", "nagryvane", "nagranie",
     }),
 }
+
+
+# The word that separates "we keep a transcript" from "we keep your voice".
+#
+# ⚠ WITHOUT THIS, `full` SATISFIED `recorded`. In ru, es and pl the two lines
+# differ by a single verb — "транскрибируется" against "записывается", "se
+# transcribe" against "se graba" — and one word out of a four-word clause still
+# clears 0.75 recall. So a callee told the call was TRANSCRIBED counted as
+# having consented to being RECORDED, which is the one substitution this level
+# exists to prevent. English escaped only because its two sentences happen to
+# differ more.
+#
+# Whole forms, and none of them appear in the weaker templates — deliberately
+# checked: Russian "запишу ответ" (I will note the answer) does NOT match
+# "записывается" here, which is exactly the distinction that matters.
+_RECORDING_FORMS = {
+    "en": frozenset({"recorded", "recording"}),
+    "ru": frozenset({"записывается", "записывают", "записываем", "запись"}),
+    "es": frozenset({"graba", "grabada", "grabando", "grabacion"}),
+    "pl": frozenset({"nagryvana", "nagrana", "nagryvane", "nagranie"}),
+}
+
+
+def _said_it_is_recorded(language: str, said: list[str]) -> bool:
+    forms = _RECORDING_FORMS.get(language, _RECORDING_FORMS["en"])
+    return any(word in forms for word in said)
 
 
 def _kept_the_retention_fact(language: str, said: list[str]) -> bool:
@@ -411,6 +455,12 @@ def disclosure_delivered(
             # templates lose the retention verb and still pass — see
             # _RETENTION_STEMS for the three languages that measurably did.
             if not _kept_the_retention_fact(lang, said):
+                continue
+            # A call whose audio is kept has to have SAID so. Checked against the
+            # level that was REQUIRED, not the one that happened to match, or a
+            # `full` line one verb away from the `recorded` one walks straight
+            # through — see _RECORDING_FORMS.
+            if level == "recorded" and not _said_it_is_recorded(lang, said):
                 continue
             if clauses and all(_spoke_clause(c, said) for c in clauses):
                 return True

@@ -30,7 +30,18 @@ class CallRequest(BaseModel):
     # have, and shortening the disclosure must be a decision the requesting
     # agent makes for a call it knows is a one-question canvass — not something
     # a heuristic does on its own.
+    # "recorded" is deliberately NOT selectable here: it is not a register the
+    # caller picks, it is the consequence of `record_audio` below, and policy
+    # forces it. Asking for it without recording would promise a callee
+    # something worse than what happens; asking for anything else WITH recording
+    # would promise something better.
     disclosure_level: Literal["brief", "light", "full"] | None = None
+    # Keep the audio, not just the transcript (BRIEF §312). Off by default and
+    # it must stay that way — every other disclosure level says we keep TEXT,
+    # which is true only while this is false. Setting it forces the "recorded"
+    # disclosure, which says so out loud, and that is not refusable: the callee
+    # cannot consent to a recording nobody mentioned.
+    record_audio: bool = False
     # Who the agent says it is calling for: "your regular customer", "Ивана".
     # Omitted → a per-language default ("a potential client"). Free text chosen
     # by the requesting agent from the task's context; Russian must arrive

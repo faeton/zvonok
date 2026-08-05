@@ -394,7 +394,11 @@ _COMMITMENT_WORDS = (
 
 
 def disclosure_level_for(
-    country: str | None, goal: str, override: str | None = None
+    country: str | None,
+    goal: str,
+    override: str | None = None,
+    *,
+    record_audio: bool = False,
 ) -> str:
     """Pick the disclosure register. An explicit request wins — except upward.
 
@@ -436,6 +440,15 @@ def disclosure_level_for(
     the requester knows it is a fifteen-second stock check, and we only know
     where the call is going.
     """
+    # ⚠ FIRST, AND NOT OVERRIDABLE. Every other level's wording promises the
+    # callee we keep TEXT, which is true exactly while audio recording is off.
+    # Once it is on, "I'll note your answer down" is a false statement made to
+    # someone who cannot check it — so the level that says "this call is being
+    # recorded" is forced, and no override, country or goal can talk it back
+    # down. Nobody consents to a recording that was never mentioned.
+    if record_audio:
+        return "recorded"
+
     # Drop the ordinal sense of "order" before looking for commitments, so that
     # telling the agent HOW to ask does not read as telling it to buy something.
     low = _ORDINAL_IDIOMS.sub(" ", (goal or "").lower())

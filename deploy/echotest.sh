@@ -28,6 +28,7 @@ MAX_DURATION="${1:-45}"
 CALLER_ID="${2:-${ZVONOK_DEFAULT_CALLER_ID:?ZVONOK_DEFAULT_CALLER_ID not in .env}}"
 
 ./lkctl.sh dispatch \
+  --record \
   --number 4444 \
   --goal "You have reached an automated echo test, not a person. Say clearly and slowly: 'Echo test, one, two, three, four, five.' Then stop talking. You will hear your own voice repeated back — that is the test working, not someone replying, so do not respond to it. End the call after the playback." \
   --language en \

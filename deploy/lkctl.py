@@ -279,6 +279,13 @@ async def cmd_dispatch(args: argparse.Namespace) -> None:
         "caller_id": args.caller_id,
         "job_id": job_id,
         "max_duration_seconds": args.max_duration,
+        # This path bypasses call-api, so it also bypasses the policy that
+        # pairs recording with the disclosure that admits to it. That is
+        # acceptable for the echo test — 4444 is a machine and there is nobody
+        # to disclose to — and it is NOT acceptable for anything else. Recording
+        # a person from here would record them without telling them.
+        "record_audio": args.record,
+        "disclosure_level": "recorded" if args.record else None,
     })
 
     print(f"job:       {job_id}")
@@ -363,6 +370,12 @@ def main() -> None:
     d.add_argument("--caller-id", dest="caller_id", default=DEFAULT_CALLER_ID)
     d.add_argument("--max-duration", dest="max_duration", type=int, default=300)
     d.add_argument("--job-id", dest="job_id", default=None)
+    d.add_argument(
+        "--record", action="store_true",
+        help="keep the audio as WAV next to the transcript. For the echo test "
+             "and for numbers we own; recording a person from here would do it "
+             "without telling them (call-api forces the disclosure, this does not)",
+    )
 
     sub.add_parser("rooms", help="list live calls")
 

@@ -304,7 +304,8 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         limits.max_duration_hard,
     )
     disclosure_level = policy.disclosure_level_for(
-        destination.country, req.goal, req.disclosure_level
+        destination.country, req.goal, req.disclosure_level,
+        record_audio=req.record_audio,
     )
     job_id = new_call_id()
     room = dispatch.room_name_for(job_id)
@@ -409,6 +410,8 @@ async def create_call(req: CallRequest, identity: ClientId) -> CallCreated:
         # None on the overwhelming majority of calls; the agent omits the line
         # entirely rather than printing an empty section.
         "prior_attempt": prior_attempt,
+        # Paired with disclosure_level == "recorded" by policy, never set alone.
+        "record_audio": req.record_audio,
     }
 
     # The attempt row is opened BEFORE the dispatch. An instant carrier

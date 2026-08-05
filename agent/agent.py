@@ -77,6 +77,7 @@ from timing import (
     SILENCE_NUDGE_SECONDS,
     output_gain,
 )
+from recorder import CallRecorder
 from voice import apply_gain, build_realtime_model
 
 logger = logging.getLogger("zvonok")
@@ -262,6 +263,7 @@ class ZvonokCaller(Agent):
         introduce_as: str | None = None,
         prior_attempt: str | None = None,
         turns: list[dict[str, Any]] | None = None,
+        recorder: CallRecorder | None = None,
     ) -> None:
         super().__init__(
             instructions=build_instructions(
@@ -275,6 +277,7 @@ class ZvonokCaller(Agent):
         )
         self.dial_info = dial_info
         self.term = term
+        self.recorder = recorder
         self.language = language
         self.disclosure_level = disclosure_level
         self.introduce_as = introduce_as
@@ -301,7 +304,13 @@ class ZvonokCaller(Agent):
         async for frame in Agent.default.realtime_audio_output_node(
             self, audio, model_settings
         ):
-            yield apply_gain(frame, OUTPUT_GAIN)
+            boosted = apply_gain(frame, OUTPUT_GAIN)
+            # Recorded AFTER the gain, because the question this file exists to
+            # answer is "how did we sound to them", and the gain is part of the
+            # answer. No-op unless the call asked to be recorded.
+            if self.recorder is not None:
+                self.recorder.write_ours(boosted)
+            yield boosted
 
     def hangup_after_goodbye(self, session: AgentSession) -> None:
         """Hang up once the agent has finished its closing line.
@@ -572,6 +581,18 @@ async def entrypoint(ctx: JobContext) -> None:
         job_id, number, language, caller_id, max_duration,
     )
 
+    # Audio recording. Off unless the job says otherwise (BRIEF §312), and
+    # call-api will not say otherwise without also forcing a disclosure that
+    # says "recorded" out loud — the short wording promises we keep text, and it
+    # has to stop being said the moment that stops being true.
+    record_audio = bool(meta.get("record_audio"))
+    recorder = CallRecorder(
+        job_id, record_audio,
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+    )
+    if record_audio:
+        logger.info("job %s: AUDIO RECORDING ON for this call", job_id)
+
     await ctx.connect()
 
     term = Terminator()
@@ -589,6 +610,7 @@ async def entrypoint(ctx: JobContext) -> None:
         introduce_as=introduce_as,
         prior_attempt=prior_attempt,
         turns=turns,
+        recorder=recorder,
     )
 
     session = AgentSession(llm=build_realtime_model(language, keywords))
@@ -700,6 +722,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # the PSTN leg has already been answered and is billing, so we must still
     # tear down and still leave a record.
     async def on_shutdown() -> None:
+        # Before the tasks are cancelled: closing writes the WAV header, and a
+        # file left without one is unplayable — which for a recording is
+        # indistinguishable from never having recorded at all.
+        recorder.close()
         for t in tasks:
             t.cancel()
         # Hang up if nothing else already has. An exception raised after the
@@ -717,6 +743,26 @@ async def entrypoint(ctx: JobContext) -> None:
     # Also registered before dialling: a participant that answers and drops again
     # while we are still awaiting session start would otherwise disconnect before
     # the listener exists, and events are not replayed to late subscribers.
+    # The other half of the recording: what THEY sent us. Registered only when
+    # the call asked for it, so the ordinary path does not even subscribe.
+    if record_audio:
+
+        async def _drain(track: rtc.Track) -> None:
+            async for ev in rtc.AudioStream(track):
+                recorder.write_theirs(ev.frame)
+
+        @ctx.room.on("track_subscribed")
+        def _on_track(
+            track: rtc.Track,
+            publication: rtc.TrackPublication,
+            participant: rtc.RemoteParticipant,
+        ) -> None:
+            if participant.identity != number:
+                return
+            if track.kind != rtc.TrackKind.KIND_AUDIO:
+                return
+            _spawn(_drain(track), "record_callee_audio")
+
     @ctx.room.on("participant_disconnected")
     def _on_disconnected(p: rtc.RemoteParticipant) -> None:
         if p.identity != number:

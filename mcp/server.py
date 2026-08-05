@@ -110,6 +110,7 @@ def phone_call(
     introduce_as: str | None = None,
     keywords: list[str] | None = None,
     idempotency_key: str | None = None,
+    record_audio: bool = False,
 ) -> str:
     """Place a real phone call to accomplish a task, and get the answer back.
 
@@ -142,6 +143,12 @@ def phone_call(
         max_duration_seconds: Hard cap on the call, default 300, maximum 600.
         wait_seconds: How long to wait for a dialling verdict before returning
             (0-30). This never waits for the conversation to finish.
+        record_audio: Keep the call's audio as WAV alongside the transcript,
+            instead of text only. Default false and normally leave it so: it
+            FORCES the long "this call is being recorded" disclosure, which
+            measurably costs calls, and it is not talked back down by
+            disclosure_level. Its honest use is diagnosing how we sound, on a
+            call to a number you own.
         disclosure_level: "brief", "light" or "full". Leave unset for anything
             that is a conversation — it is then chosen from the destination
             country and the goal, and "full" adds explicit
@@ -188,6 +195,8 @@ def phone_call(
         payload["disclosure_level"] = disclosure_level
     if introduce_as:
         payload["introduce_as"] = introduce_as
+    if record_audio:
+        payload["record_audio"] = True
     if keywords:
         payload["keywords"] = keywords
 
