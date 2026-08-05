@@ -331,8 +331,10 @@ def prior_attempt_note(
         return (
             f"You already called this number about {minutes} minute"
             f"{'s' if minutes != 1 else ''} ago and the call ended without an "
-            f"answer. Open by saying so — that you rang a moment ago and were "
-            f"cut off — then ask your question. Do not pretend it is a first call."
+            f"answer. Do NOT open with that — the question still comes first, or "
+            f"this call ends where the last one did. Say it only if they ask why "
+            f"you are calling again, or sound as though they recognise you: "
+            f"\"sorry, I rang a moment ago and we were cut off\". Four words, once."
         )
     return None
 

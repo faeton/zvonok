@@ -894,6 +894,13 @@ def test_prior_attempt() -> None:
     recent = policy.prior_attempt_note([row(8)], now)
     expect("a recent failed call is mentioned", recent is not None)
     expect("it says how long ago", "8 minutes" in (recent or ""))
+    # ⚠ It must NOT tell the agent to lead with the apology. The first version
+    # said "Open by saying so", and on a real call that produced
+    # "…anotaré la respuesta. Llamé hace un momento y se cortó. ¿Es esta la
+    # tienda Swatch de…" — three sentences, hung up at 15.8s, the question never
+    # asked. The apology is for someone who asks why you rang again.
+    expect("it does not tell the agent to open with the apology",
+           "Do NOT open with that" in (recent or ""))
     expect("one minute is singular",
            "1 minute " in (policy.prior_attempt_note([row(1)], now) or ""))
     # A call that got its answer has no business ringing again, and apologising
