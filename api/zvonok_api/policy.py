@@ -349,9 +349,24 @@ _FULL_DISCLOSURE_COUNTRIES = frozenset({"DE", "CH", "PL"})
 # Goals that commit or book something on someone's behalf get the explicit
 # transcribe-and-store wording. Keyword matching is acceptable here — unlike in
 # the voice agent, where classification must go by turn shape rather than word
-# lists — because the goal is OUR text, written by the requesting agent, and the
-# failure mode is asymmetric: a false positive only makes the disclosure more
-# explicit than it needed to be.
+# lists — because the goal is OUR text, written by the requesting agent.
+#
+# ⚠ WHAT IS NOT TRUE, and used to be claimed here: that the failure mode is
+# asymmetric because "a false positive only makes the disclosure more explicit
+# than it needed to be". Measured on 2026-08-05, a false positive KILLS THE
+# CALL. A goal reading "ask, in this order, one at a time" matched "order" as a
+# substring, took the call to `full`, and the callee hung up 17 seconds in,
+# during the eleven-second recital, without hearing a single question. The two
+# directions cost different things but neither is free, and this one is not the
+# safe one.
+#
+# Hence _ORDINAL_IDIOMS: English "order" is two words wearing one spelling, and
+# only one of them is a commitment.
+_ORDINAL_IDIOMS = re.compile(
+    r"\bin (?:this|that|the following|the|reverse|any|no particular) order\b"
+    r"|\bin order to\b|\bthe order of\b|\border of (?:the|these|those)\b",
+    re.IGNORECASE,
+)
 #
 # ⚠ This list is a BACKSTOP and is necessarily incomplete: it cannot cover every
 # way to express a commitment in four languages, let alone a goal phrased
@@ -419,7 +434,9 @@ def disclosure_level_for(
     the requester knows it is a fifteen-second stock check, and we only know
     where the call is going.
     """
-    low = (goal or "").lower()
+    # Drop the ordinal sense of "order" before looking for commitments, so that
+    # telling the agent HOW to ask does not read as telling it to buy something.
+    low = _ORDINAL_IDIOMS.sub(" ", (goal or "").lower())
     commits = any(w in low for w in _COMMITMENT_WORDS)
 
     # ⚠ ANY override below `full`, not just `brief`. This read `override ==

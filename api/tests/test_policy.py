@@ -397,6 +397,23 @@ def test_disclosure() -> None:
            policy.disclosure_level_for("ES", "Book a table", "brief") == "full")
     expect("an explicit override still wins on a plain question",
            policy.disclosure_level_for("DE", "Ask about parking", "light") == "light")
+    # ⚠ Measured, not hypothetical. This exact goal wording took a Valencia call
+    # to `full` on 2026-08-05: "order" matched as a substring of "in this
+    # order", the callee got the eleven-second recital and hung up at 17s
+    # without hearing a question. Telling the agent HOW to ask is not a
+    # commitment to buy.
+    for ordinal in ("Ask, in this order, one at a time: do they have it?",
+                    "In order to check stock, ask whether they have it",
+                    "Ask these in the order given",
+                    "Read them back in reverse order"):
+        expect(f"ordinal 'order' is not a commitment: {ordinal[:28]!r}",
+               policy.disclosure_level_for("ES", ordinal) == "brief")
+    # ...without going deaf to the real thing.
+    for real in ("Order two pizzas for delivery",
+                 "Place an order for four of them",
+                 "Ask them to order it in for us"):
+        expect(f"a real order is still a commitment: {real[:24]!r}",
+               policy.disclosure_level_for("ES", real) == "full")
     # `brief` drops the principal entirely, so it is the one override that must
     # not be able to go under the floor. A playbook file asking for brief on a
     # booking would otherwise commit something in someone's name behind the
